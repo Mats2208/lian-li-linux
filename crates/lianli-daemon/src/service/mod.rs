@@ -66,6 +66,10 @@ impl Drop for WatchdogClearGuard {
     }
 }
 
+/// How long graceful shutdown gets before the process is forced down.
+/// Must exceed the longest blocking USB call, or the device is left mid-transfer.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+
 /// Parse a colon-separated MAC address string (e.g. `"01:23:45:67:89:AB"`)
 /// into a 6-byte array. Returns `None` on malformed input.
 fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
@@ -461,6 +465,7 @@ impl ServiceManager {
 
         SysSensor::init();
 
+
         let shutdown_tx = tx.clone();
         thread::spawn(move || {
             use signal_hook::consts::{SIGINT, SIGTERM};
@@ -470,8 +475,22 @@ impl ServiceManager {
                     let _ = shutdown_tx.send(DaemonEvent::Shutdown);
                     // Force exit if graceful shutdown stalls (e.g. blocking USB
                     // call in a worker thread).
-                    thread::sleep(Duration::from_secs(5));
-                    warn!("shutdown exceeded 5s grace period, forcing exit");
+                    //
+                    // FIX: 5s was not enough and the process died with a bulk
+                    // transfer still in flight, which leaves the HydroShift II
+                    // MCU waiting for the rest of a transaction it never gets.
+                    // It then stops servicing its USB stack entirely — no
+                    // descriptors, no bulk — and only a power cycle brings it
+                    // back; a libusb reset does not. Worst case here is the
+                    // interface-claim retry loop (20 x 250ms) plus a 2s read
+                    // timeout, so 5s expired right in the middle of it. Give
+                    // graceful shutdown room to actually finish.
+                    thread::sleep(SHUTDOWN_GRACE);
+                    warn!(
+                        "shutdown exceeded {}s grace period, forcing exit — \
+                         a USB transfer may be left in flight",
+                        SHUTDOWN_GRACE.as_secs()
+                    );
                     std::process::exit(0);
                 }
             }
