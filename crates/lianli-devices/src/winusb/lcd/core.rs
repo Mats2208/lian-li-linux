@@ -30,6 +30,32 @@ pub(crate) struct WinUsbLcdCore {
     pub(crate) firmware: Option<String>,
 }
 
+
+/// Read the serial the kernel cached at enumeration, matching on bus/device
+/// number. Preferred over a live EP0 read: it cannot stall.
+fn sysfs_serial(bus: u8, address: u8) -> Option<String> {
+    let entries = std::fs::read_dir("/sys/bus/usb/devices").ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let rd = |f: &str| std::fs::read_to_string(path.join(f)).ok();
+        let (Some(b), Some(d)) = (rd("busnum"), rd("devnum")) else {
+            continue;
+        };
+        if b.trim().parse::<u8>().ok() != Some(bus)
+            || d.trim().parse::<u8>().ok() != Some(address)
+        {
+            continue;
+        }
+        let serial = rd("serial")?;
+        let serial = serial.trim();
+        if !serial.is_empty() {
+            tracing::debug!("using kernel-cached serial {serial}");
+            return Some(serial.to_string());
+        }
+    }
+    None
+}
+
 impl WinUsbLcdCore {
     pub(crate) fn open(
         device: Device<GlobalContext>,
@@ -43,10 +69,25 @@ impl WinUsbLcdCore {
         let desc = device
             .device_descriptor()
             .context("reading device descriptor")?;
-        let serial = device
-            .open()
-            .and_then(|h| h.read_serial_number_string_ascii(&desc))
-            .unwrap_or_else(|_| format!("bus{bus}-addr{address}"));
+        // FIX: some units stop answering EP0 string-descriptor requests while
+        // their bulk pipe keeps working, so the live read fails and the device
+        // silently gets a positional id. That breaks config lookup (which keys
+        // on the serial) and makes the daemon re-open an already-claimed
+        // interface. The kernel cached the serial at enumeration time, so fall
+        // back to sysfs before giving up on identity.
+        // Ask the kernel first. It read the serial at enumeration, so this is a
+        // cheap file read that always works. Going to the device instead costs
+        // ~5s of EP0 timeouts on units that stop answering string-descriptor
+        // requests, and that delay widens the window in which a second open
+        // thread races this one and hits EBUSY on interface 0.
+        let serial = sysfs_serial(bus, address)
+            .or_else(|| {
+                device
+                    .open()
+                    .and_then(|h| h.read_serial_number_string_ascii(&desc))
+                    .ok()
+            })
+            .unwrap_or_else(|| format!("bus{bus}-addr{address}"));
 
         let mut transport = RusbBulk::open_device(device.clone()).context("opening WinUSB LCD")?;
         transport
@@ -157,6 +198,13 @@ impl WinUsbLcdCore {
         self.consecutive_failures += 1;
 
         if let Some(raw) = &self.raw_device {
+            // FIX: release the interfaces the current handle holds *before*
+            // reopening. The replacement only lands in self.transport once the
+            // new open succeeds, so without this the old handle still owns
+            // interface 0 and every claim_interface(0) returns EBUSY — the
+            // recovery path could never succeed, it just retried 20 times
+            // against a device already in an error state.
+            self.transport.lock().release();
             std::thread::sleep(REOPEN_DELAY);
             match RusbBulk::open_device(raw.clone()) {
                 Ok(mut t) => {
