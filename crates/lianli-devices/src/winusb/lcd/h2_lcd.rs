@@ -35,12 +35,21 @@ impl H2WinUsbLcd {
         self.core.init_logging();
         self.core.reset_failure_state();
         self.core.read_firmware();
-        self.core.set_frame_rate(30)?;
+        // FIX: this AIO never answers GetVer and set_frame_rate can fail
+        // transiently. The `?` aborted do_init and left the shared control
+        // channel unusable, taking fans and RGB down with it. Degrade instead.
+        if let Err(e) = self.core.set_frame_rate(30) {
+            tracing::warn!("set_frame_rate failed, continuing anyway: {e:#}");
+        }
         let sync = self.core.builder_mut().sync_clock_header_winusb(2);
         self.core.send_command(sync, "SyncClock");
         let stop_clock = self.core.builder_mut().stop_clock_header_winusb();
         self.core.send_command(stop_clock, "StopClock");
-        self.core.clear_layers();
+        // FIX: clear_layers() paints a black 480x480 PNG over the panel. With
+        // `lcds: []` the daemon never draws anything afterwards, so the screen
+        // stays black and the firmware's own content is wiped. Media streaming
+        // overwrites every frame anyway, so clearing here buys nothing.
+        // self.core.clear_layers();
         self.core.initialized = true;
         Ok(())
     }
