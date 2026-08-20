@@ -192,6 +192,9 @@ impl WinUsbLcdCore {
     /// siblings like the LED MCU). Falls back to clear_halt when no raw device
     /// is available (shared-transport path).
     fn try_recover(&mut self) -> Result<()> {
+        if lianli_transport::usb::shutting_down() {
+            bail!("shutting down; skipping recovery");
+        }
         if self.device_gone {
             bail!("device handle is stale; re-discovery required");
         }

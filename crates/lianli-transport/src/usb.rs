@@ -27,6 +27,19 @@ pub const LCD_READ_TIMEOUT: Duration = Duration::from_millis(2_000);
 ///
 /// Auto-detects endpoint transfer types (bulk vs interrupt) from the USB
 /// descriptor so the correct libusb call is used.
+
+/// Set once the daemon starts shutting down. Long retry loops in this module
+/// poll it so a worker thread never sits inside a multi-second USB retry while
+/// `shutdown()` is blocked joining it — that stall is what forced the process
+/// to exit with a transfer still in flight, which hangs the device MCU.
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True once shutdown has begun; long loops must bail out promptly.
+pub fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct RusbBulk {
     handle: DeviceHandle<GlobalContext>,
     ep_out: u8,
@@ -113,6 +126,10 @@ impl RusbBulk {
                 warn!("{name} interface 0 busy, retrying...");
                 let mut claimed = false;
                 for attempt in 1..=20u32 {
+                    if shutting_down() {
+                        warn!("{name}: aborting interface claim, shutting down");
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(250));
                     if let Ok(true) = self.handle.kernel_driver_active(0) {
                         let _ = self.handle.detach_kernel_driver(0);
