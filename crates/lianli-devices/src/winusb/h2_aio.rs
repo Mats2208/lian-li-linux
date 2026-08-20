@@ -5,7 +5,6 @@
 use crate::crypto::PacketBuilder;
 use crate::traits::{AioDevice, FanDevice, RgbDevice};
 use anyhow::{Context, Result};
-use lianli_shared::fan::duty_to_percent;
 use lianli_shared::rgb::{RgbEffect, RgbMode, RgbZoneInfo};
 use lianli_transport::usb::{RusbBulk, LCD_READ_TIMEOUT, LCD_WRITE_TIMEOUT};
 use parking_lot::Mutex;
@@ -272,7 +271,9 @@ fn scale_brightness([r, g, b]: [u8; 3], brightness: u8) -> [u8; 3] {
 impl FanDevice for H2AioController {
     fn set_fan_speed(&self, slot: u8, duty: u8) -> Result<()> {
         let mut duties = *self.last_fan_duties.lock();
-        duties[slot as usize % 3] = duty_to_percent(duty);
+        // FIX: SyncPumpFan's fan bytes are 0-255, NOT 0-100. Verified on
+        // hardware: raw byte 150 -> 1256 RPM (model RPM = 8.43 x byte, 0.6% error).
+        duties[slot as usize % 3] = duty;
         *self.last_fan_duties.lock() = duties;
         let pump_pwm = self.duty_to_pwm(*self.last_pump_duty.lock());
         self.sync_pump_fan(pump_pwm, duties)
@@ -281,7 +282,8 @@ impl FanDevice for H2AioController {
     fn set_fan_speeds(&self, duties: &[u8]) -> Result<()> {
         let mut fan_duties = [0u8; 3];
         for (i, &d) in duties.iter().enumerate().take(3) {
-            fan_duties[i] = duty_to_percent(d);
+            // FIX: raw 0-255, see note in set_fan_speed.
+            fan_duties[i] = d;
         }
         *self.last_fan_duties.lock() = fan_duties;
         let pump_pwm = self.duty_to_pwm(*self.last_pump_duty.lock());
