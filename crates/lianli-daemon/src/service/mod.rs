@@ -472,6 +472,12 @@ impl ServiceManager {
             if let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
                 if let Some(sig) = signals.forever().next() {
                     info!("received signal {sig}, shutting down");
+                    // Raise this first: worker threads sitting in multi-second
+                    // USB retry loops poll it and bail out, so shutdown()'s
+                    // join() can actually return instead of stalling until the
+                    // grace period forces a mid-transfer exit.
+                    lianli_transport::usb::SHUTTING_DOWN
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = shutdown_tx.send(DaemonEvent::Shutdown);
                     // Force exit if graceful shutdown stalls (e.g. blocking USB
                     // call in a worker thread).

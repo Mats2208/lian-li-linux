@@ -91,16 +91,19 @@ impl H2AioController {
 
     pub fn get_h2_params(&self) -> Result<H2Params> {
         let header = self.builder.lock().get_h2_params_header_winusb();
-        {
+
+        // FIX: hold the transport across both halves of the exchange. The lock
+        // used to be dropped between the write and the read, so the fan loop's
+        // once-a-second SyncPumpFan could slip into the gap on this shared
+        // transport and this read would consume *that* command's reply. The
+        // RPM fields happen to line up, which is why only the coolant byte
+        // looked wrong (reported 105 C against a real 28 C).
+        let mut buf = [0u8; 512];
+        let n = {
             let transport = self.transport.lock();
             transport
                 .write(&header, LCD_WRITE_TIMEOUT)
                 .context("H2: GetH2Params write")?;
-        }
-
-        let mut buf = [0u8; 512];
-        let n = {
-            let transport = self.transport.lock();
             transport
                 .read(&mut buf, LCD_READ_TIMEOUT)
                 .context("H2: GetH2Params read")?
