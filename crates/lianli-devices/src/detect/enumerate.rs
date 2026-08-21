@@ -6,6 +6,31 @@ use std::collections::HashMap;
 use tracing::{debug, warn};
 
 /// Enumerate all Lian Li USB devices on the system, sorted by (bus, address).
+
+/// Serial the kernel cached at enumeration, matched on bus/device number.
+/// Cheap file read, and unlike an EP0 request it cannot stall or upset a
+/// device that does not implement string descriptors.
+fn sysfs_serial(bus: u8, address: u8) -> Option<String> {
+    for entry in std::fs::read_dir("/sys/bus/usb/devices").ok()?.flatten() {
+        let path = entry.path();
+        let rd = |f: &str| std::fs::read_to_string(path.join(f)).ok();
+        let (Some(b), Some(d)) = (rd("busnum"), rd("devnum")) else {
+            continue;
+        };
+        if b.trim().parse::<u8>().ok() != Some(bus)
+            || d.trim().parse::<u8>().ok() != Some(address)
+        {
+            continue;
+        }
+        let serial = rd("serial")?;
+        let serial = serial.trim();
+        if !serial.is_empty() {
+            return Some(serial.to_string());
+        }
+    }
+    None
+}
+
 pub fn enumerate_devices() -> Result<Vec<DetectedDevice>> {
     let usb_devices = rusb::devices()?;
     let mut found = Vec::new();
@@ -31,10 +56,24 @@ pub fn enumerate_devices() -> Result<Vec<DetectedDevice>> {
             let bus = device.bus_number();
             let address = device.address();
 
-            let serial = device
-                .open()
-                .ok()
-                .and_then(|h| h.read_serial_number_string_ascii(&desc).ok());
+            // FIX: ask the kernel, which cached the serial at enumeration, and
+            // only fall back to the device itself. This runs once a second for
+            // every known device, and the previous version opened each one and
+            // issued an EP0 string-descriptor request every time.
+            //
+            // Some controllers stop answering string descriptors while their
+            // bulk pipe still works — the HydroShift II LCD Circle here returned
+            // nothing on 17 consecutive attempts. Asking anyway, once a second,
+            // wedges it: after roughly 47s it stops accepting writes altogether,
+            // reads keep succeeding, and the fans quietly decay to minimum with
+            // nothing logged. Driving the same device from a script that never
+            // enumerates ran 180s without a single failure.
+            let serial = sysfs_serial(bus, address).or_else(|| {
+                device
+                    .open()
+                    .ok()
+                    .and_then(|h| h.read_serial_number_string_ascii(&desc).ok())
+            });
 
             debug!(
                 "Found {} ({:04x}:{:04x}) at bus {} addr {} serial={}",
