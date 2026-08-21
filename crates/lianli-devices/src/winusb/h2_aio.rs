@@ -19,6 +19,7 @@ const PUMP_MAX_RPM_SQUARE: u16 = 3200;
 const RING_LED_COUNT: usize = 24;
 
 /// Telemetry parsed from GetH2Params response.
+#[derive(Clone)]
 pub struct H2Params {
     pub cpu_temp: u8,
     pub cpu_load: u8,
@@ -59,6 +60,12 @@ pub struct H2AioController {
     is_square: bool,
     is_wireless: AtomicBool,
     mac: Mutex<Option<[u8; 6]>>,
+    /// Last GetH2Params reply plus when it arrived. Callers ask for coolant and
+    /// fan RPM separately, but both live in the same 512-byte response; issuing
+    /// two exchanges back to back made each one drain the other's reply, so the
+    /// two fields alternated between real data and zeros. One exchange feeds
+    /// both within this window.
+    params_cache: Mutex<Option<(std::time::Instant, H2Params)>>,
 }
 
 impl H2AioController {
@@ -71,6 +78,7 @@ impl H2AioController {
             is_square: pid == 0xA034,
             is_wireless: AtomicBool::new(false),
             mac: Mutex::new(None),
+            params_cache: Mutex::new(None),
         };
         wake(&transport);
         tracing::info!("HydroShift II control channel opened (shared transport)");
@@ -89,28 +97,59 @@ impl H2AioController {
         *self.mac.lock()
     }
 
+    /// How long a GetH2Params reply is reused before going back to the wire.
+    /// Long enough to cover a poll cycle's coolant+RPM pair, far shorter than
+    /// the 1s telemetry tick, so readings stay live.
+    const PARAMS_CACHE_TTL: Duration = Duration::from_millis(300);
+
     pub fn get_h2_params(&self) -> Result<H2Params> {
+        if let Some((at, cached)) = self.params_cache.lock().as_ref() {
+            if at.elapsed() < Self::PARAMS_CACHE_TTL {
+                return Ok(cached.clone());
+            }
+        }
         let header = self.builder.lock().get_h2_params_header_winusb();
 
-        // FIX: hold the transport across both halves of the exchange. The lock
-        // used to be dropped between the write and the read, so the fan loop's
-        // once-a-second SyncPumpFan could slip into the gap on this shared
-        // transport and this read would consume *that* command's reply. The
-        // RPM fields happen to line up, which is why only the coolant byte
-        // looked wrong (reported 105 C against a real 28 C).
+        // The transport stays locked across both halves of each exchange; it
+        // used to be released between them, letting another command's reply be
+        // consumed here.
+        // Two attempts. sync_pump_fan() fires once a second on this shared
+        // transport and only waits before discarding its own reply, so a late
+        // answer can still be sitting in the pipe. The first exchange then
+        // consumes that stale frame and the second gets the real one — which is
+        // why coolant read a constant 105 C (a field of the fixed SyncPumpFan
+        // reply) instead of the true ~26 C.
         let mut buf = [0u8; 512];
-        let n = {
-            let transport = self.transport.lock();
-            transport
-                .write(&header, LCD_WRITE_TIMEOUT)
-                .context("H2: GetH2Params write")?;
-            transport
-                .read(&mut buf, LCD_READ_TIMEOUT)
-                .context("H2: GetH2Params read")?
-        };
-
-        if n < 32 {
-            anyhow::bail!("H2: GetH2Params response too short ({n} bytes)");
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut got = false;
+        for attempt in 0..2 {
+            let hdr = if attempt == 0 {
+                header.clone()
+            } else {
+                self.builder.lock().get_h2_params_header_winusb()
+            };
+            let res = {
+                let transport = self.transport.lock();
+                transport
+                    .write(&hdr, LCD_WRITE_TIMEOUT)
+                    .context("H2: GetH2Params write")
+                    .and_then(|_| {
+                        transport
+                            .read(&mut buf, LCD_READ_TIMEOUT)
+                            .context("H2: GetH2Params read")
+                    })
+            };
+            match res {
+                Ok(k) if k >= 32 => {
+                    got = true;
+                    break;
+                }
+                Ok(k) => last_err = Some(anyhow::anyhow!("response too short ({k} bytes)")),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if !got {
+            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("H2: GetH2Params failed")));
         }
 
         let mac = {
@@ -125,7 +164,7 @@ impl H2AioController {
             *self.mac.lock() = mac;
         }
 
-        Ok(H2Params {
+        let parsed = H2Params {
             cpu_temp: 0,
             cpu_load: 0,
             gpu_temp: 0,
@@ -138,7 +177,9 @@ impl H2AioController {
             ],
             coolant_temp: buf[13],
             mac,
-        })
+        };
+        *self.params_cache.lock() = Some((std::time::Instant::now(), parsed.clone()));
+        Ok(parsed)
     }
 
     /// Send pump + fan PWM via SyncPumpFan (0xFB).
@@ -156,8 +197,10 @@ impl H2AioController {
         transport
             .write(&header, LCD_WRITE_TIMEOUT)
             .context("H2: SyncPumpFan write")?;
+        // FIX: give the reply enough time to arrive and be discarded here.
+        // At 50ms a slower answer stayed queued and poisoned the next read.
         let mut buf = [0u8; 512];
-        let _ = transport.read(&mut buf, Duration::from_millis(50));
+        let _ = transport.read(&mut buf, Duration::from_millis(250));
         debug!("H2: SyncPumpFan pump_pwm={pump_pwm} fans={:?}", fan_duties);
         Ok(())
     }
