@@ -291,12 +291,19 @@ fn warn_unresolvable(
 ) {
     use std::sync::Mutex as StdMutex;
     use std::time::Instant;
-    static LAST: StdMutex<Option<Instant>> = StdMutex::new(None);
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if last.map(|t| t.elapsed() < Duration::from_secs(60)).unwrap_or(false) {
+    // Per device: one AIO going quiet must not mute the others.
+    static LAST: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
+    let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = guard.get_or_insert_with(HashMap::new);
+    if seen
+        .get(base_id)
+        .map(|t| t.elapsed() < Duration::from_secs(60))
+        .unwrap_or(false)
+    {
         return;
     }
-    *last = Some(Instant::now());
+    seen.insert(base_id.to_string(), Instant::now());
+    drop(guard);
 
     let names: Vec<&str> = aio_cfg
         .fan_speeds
