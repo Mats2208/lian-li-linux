@@ -70,6 +70,11 @@ impl Drop for WatchdogClearGuard {
 /// Must exceed the longest blocking USB call, or the device is left mid-transfer.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
+/// Set once ServiceManager::shutdown() returns, so the signal-handler watchdog
+/// stands down instead of forcing an exit over a shutdown that already worked.
+pub(crate) static SHUTDOWN_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Parse a colon-separated MAC address string (e.g. `"01:23:45:67:89:AB"`)
 /// into a 6-byte array. Returns `None` on malformed input.
 fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
@@ -491,7 +496,17 @@ impl ServiceManager {
                     // interface-claim retry loop (20 x 250ms) plus a 2s read
                     // timeout, so 5s expired right in the middle of it. Give
                     // graceful shutdown room to actually finish.
-                    thread::sleep(SHUTDOWN_GRACE);
+                    // Only force the process down if graceful shutdown has not
+                    // finished by then; otherwise this watchdog would race the
+                    // re-exec path in main() and kill a daemon that is already
+                    // on its way out cleanly.
+                    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+                    while std::time::Instant::now() < deadline {
+                        if SHUTDOWN_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
                     warn!(
                         "shutdown exceeded {}s grace period, forcing exit — \
                          a USB transfer may be left in flight",
@@ -739,6 +754,7 @@ impl ServiceManager {
         }
 
         self.shutdown();
+        SHUTDOWN_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(self.restart_requested)
     }
 }
