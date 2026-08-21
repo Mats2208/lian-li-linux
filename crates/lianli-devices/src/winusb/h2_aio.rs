@@ -238,8 +238,13 @@ impl H2AioController {
         packet.extend_from_slice(&payload);
 
         let transport = self.transport.lock();
+        // FIX: this packet is a full 512-byte header plus the compressed RGB
+        // payload, so it is the only command here that exceeds one bulk packet.
+        // write() issues a single transfer and merely warns on a short write;
+        // write_full() loops until every byte is out. Every other command is
+        // exactly 512 bytes, which is why only RGB failed.
         transport
-            .write(&packet, LCD_WRITE_TIMEOUT)
+            .write_full(&packet, LCD_WRITE_TIMEOUT)
             .context("H2: PushRgbData write")?;
         let mut buf = [0u8; 512];
         let _ = transport.read(&mut buf, Duration::from_millis(100));
