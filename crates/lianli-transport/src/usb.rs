@@ -266,6 +266,9 @@ impl RusbBulk {
         buf: &mut [u8],
         timeout: Duration,
     ) -> Result<usize, TransportError> {
+        if shutting_down() {
+            return Err(TransportError::Usb(rusb::Error::Interrupted));
+        }
         Ok(self
             .handle
             .read_control(request_type, request, value, index, buf, timeout)?)
@@ -280,6 +283,9 @@ impl RusbBulk {
         data: &[u8],
         timeout: Duration,
     ) -> Result<usize, TransportError> {
+        if shutting_down() {
+            return Err(TransportError::Usb(rusb::Error::Interrupted));
+        }
         Ok(self
             .handle
             .write_control(request_type, request, value, index, data, timeout)?)
