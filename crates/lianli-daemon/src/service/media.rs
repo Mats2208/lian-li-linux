@@ -401,7 +401,29 @@ impl ServiceManager {
                                     .ok();
                                 self.aio_lcd_firmware
                                     .record(&candidate.device_id, None, false);
-                                if !self.aio_lcd_firmware.should_skip(&candidate.device_id) {
+                                // FIX: only chase the firmware string later if the
+                                // device answered GetVer during init. Some units
+                                // (HydroShift II LCD Circle here) never implement
+                                // it: the init read times out, and the deferred
+                                // retry 10s later times out too — but that second
+                                // attempt lands on a transport already carrying the
+                                // fan keepalive, and it wedges the controller. It
+                                // then refuses every write until power is cut,
+                                // while reads keep working, so the fans silently
+                                // decay to minimum. Reproduced on two separate runs
+                                // at +26.294s and +26.498s after start, which is
+                                // this 10s timer measured from LCD attach.
+                                let answered_getver = guard.firmware_version_str().is_some();
+                                if !answered_getver {
+                                    tracing::info!(
+                                        "{}: no GetVer response during init; skipping the \
+                                         deferred firmware read (retrying it wedges this device)",
+                                        candidate.device_id
+                                    );
+                                    self.aio_lcd_firmware.mark_failed(&candidate.device_id);
+                                }
+                                if answered_getver
+                                    && !self.aio_lcd_firmware.should_skip(&candidate.device_id) {
                                     self.aio_lcd_firmware.schedule(
                                         &candidate.device_id,
                                         std::time::Duration::from_secs(10),

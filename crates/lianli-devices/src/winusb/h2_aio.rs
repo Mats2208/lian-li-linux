@@ -66,6 +66,8 @@ pub struct H2AioController {
     /// two fields alternated between real data and zeros. One exchange feeds
     /// both within this window.
     params_cache: Mutex<Option<(std::time::Instant, H2Params)>>,
+    /// Last SyncPumpFan actually put on the wire: (when, pump_pwm, fan duties).
+    last_sync: Mutex<Option<(std::time::Instant, u16, [u8; 3])>>,
 }
 
 impl H2AioController {
@@ -79,6 +81,7 @@ impl H2AioController {
             is_wireless: AtomicBool::new(false),
             mac: Mutex::new(None),
             params_cache: Mutex::new(None),
+            last_sync: Mutex::new(None),
         };
         wake(&transport);
         tracing::info!("HydroShift II control channel opened (shared transport)");
@@ -187,6 +190,43 @@ impl H2AioController {
         if self.is_wireless.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // FIX: drop a SyncPumpFan that repeats the previous one too soon. The
+        // controller calls set_fan_speeds() and then set_pump_speed(), and each
+        // sends a full packet — but SyncPumpFan already carries pump *and* fans,
+        // so the second is an exact duplicate ~0.1ms behind the first. That put
+        // two commands per second on the wire against the ~3.6s L-Connect uses,
+        // roughly seven times the vendor's rate, and this controller stops
+        // answering writes after about 26s of it (measured at +26.294s,
+        // +26.498s and +26.522s across three runs). Reads keep working, so the
+        // fans just decay to minimum with nothing in the log.
+        //
+        // Identical packets still refresh every RESYNC_INTERVAL, far inside the
+        // ~13s the firmware waits before falling back on its own, and any change
+        // in pump or fan duty goes out immediately.
+        // Rate limit: L-Connect re-sends about every 3.6s, and this controller
+        // stops answering writes after a fixed number of them regardless of
+        // content — 2/s died at 26.5s, 1/s at 47.1s. Skipping only *identical*
+        // packets was not enough, because a curve's duty jitters by a point or
+        // two every tick and every jittered packet went out anyway.
+        //
+        // So gate on elapsed time, not equality, and let a meaningful change
+        // through immediately so the UI still feels responsive.
+        const RESYNC_INTERVAL: Duration = Duration::from_millis(3600);
+        const SIGNIFICANT_DUTY_STEP: u8 = 8;
+        {
+            let last = self.last_sync.lock();
+            if let Some((at, prev_pump, prev_fans)) = *last {
+                let changed = prev_pump != pump_pwm
+                    || prev_fans
+                        .iter()
+                        .zip(fan_duties.iter())
+                        .any(|(a, b)| a.abs_diff(*b) >= SIGNIFICANT_DUTY_STEP);
+                if !changed && at.elapsed() < RESYNC_INTERVAL {
+                    return Ok(());
+                }
+            }
+        }
+
         let header = self.builder.lock().sync_pump_fan_header_winusb(
             pump_pwm,
             fan_duties[0],
@@ -201,6 +241,7 @@ impl H2AioController {
         // At 50ms a slower answer stayed queued and poisoned the next read.
         let mut buf = [0u8; 512];
         let _ = transport.read(&mut buf, Duration::from_millis(250));
+        *self.last_sync.lock() = Some((std::time::Instant::now(), pump_pwm, fan_duties));
         debug!("H2: SyncPumpFan pump_pwm={pump_pwm} fans={:?}", fan_duties);
         Ok(())
     }
