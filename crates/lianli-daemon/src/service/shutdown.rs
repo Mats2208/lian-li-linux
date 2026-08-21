@@ -13,6 +13,18 @@ impl ServiceManager {
         };
 
         info!("shutdown: begin");
+
+        // FIX: the direct-color writer thread is spawned with a clone of the
+        // OpenRGB stop flag (init.rs), but Controllers::shutdown() joins that
+        // thread while the flag is still false — openrgb.shutdown() only raises
+        // it further down, after the join it is waiting on. The writer loops
+        // forever, join() never returns, and the signal handler eventually
+        // forces the process down with a USB transfer in flight, which is what
+        // leaves the HydroShift II MCU unresponsive. Raise it up front.
+        self.openrgb
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         self.desktop_displays.shutdown();
         mark("desktop_displays", t0);
 
