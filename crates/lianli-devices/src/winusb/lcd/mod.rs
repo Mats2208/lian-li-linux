@@ -23,7 +23,7 @@ mod hs2_oled;
 mod slv3;
 mod trait_;
 
-pub use self::core::SharedTransport;
+pub use self::core::{LcdLink, PendingCmd, SharedTransport};
 use self::trait_::BoxedWinUsbLcd;
 
 pub struct WinUsbLcdDevice(BoxedWinUsbLcd);

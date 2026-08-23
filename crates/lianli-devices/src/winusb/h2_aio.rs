@@ -1,12 +1,15 @@
 //! HydroShift II AIO controller — pump + fan + RGB ring.
 //!
-//! Shares the LCD device's USB handle via `Arc<Mutex<RusbBulk>>`.
+//! Shares the LCD device's USB handle via [`SharedTransport`] (`Arc<LcdLink>`).
+//! While the LCD is streaming H.264, control writes are handed to the stream
+//! thread (see `LcdLink`) instead of going straight on the wire.
 
+use super::lcd::{PendingCmd, SharedTransport};
 use crate::crypto::PacketBuilder;
 use crate::traits::{AioDevice, FanDevice, RgbDevice};
 use anyhow::{Context, Result};
 use lianli_shared::rgb::{RgbEffect, RgbMode, RgbZoneInfo};
-use lianli_transport::usb::{RusbBulk, LCD_READ_TIMEOUT, LCD_WRITE_TIMEOUT};
+use lianli_transport::usb::{LCD_READ_TIMEOUT, LCD_WRITE_TIMEOUT};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,7 +36,7 @@ pub struct H2Params {
 
 /// After LCD play mode the device ignores control commands until this
 /// StopPlay → StopClock → GetVer preamble re-arms the channel.
-fn wake(transport: &Arc<Mutex<RusbBulk>>) {
+fn wake(transport: &SharedTransport) {
     let mut builder = PacketBuilder::new();
     let cmds = [
         builder.stop_play_header_winusb(),
@@ -53,7 +56,7 @@ fn wake(transport: &Arc<Mutex<RusbBulk>>) {
 
 /// HydroShift II AIO controller (pump + fan + RGB ring via shared handle).
 pub struct H2AioController {
-    transport: Arc<Mutex<RusbBulk>>,
+    transport: SharedTransport,
     builder: Mutex<PacketBuilder>,
     last_fan_duties: Mutex<[u8; 3]>,
     last_pump_duty: Mutex<u8>,
@@ -71,7 +74,7 @@ pub struct H2AioController {
 }
 
 impl H2AioController {
-    pub fn new(transport: Arc<Mutex<RusbBulk>>, pid: u16) -> Self {
+    pub fn new(transport: SharedTransport, pid: u16) -> Self {
         let ctrl = Self {
             transport: Arc::clone(&transport),
             builder: Mutex::new(PacketBuilder::new()),
@@ -98,6 +101,39 @@ impl H2AioController {
 
     pub fn mac(&self) -> Option<[u8; 6]> {
         *self.mac.lock()
+    }
+
+    /// Put a fire-and-forget control command on the wire, or — while the LCD
+    /// is streaming — hand it to the stream thread. A control write landing on
+    /// a full ingest buffer hangs the MCU (usbmon, 2026-08-22/23), so nothing
+    /// is written from here mid-stream. `play_safe` commands are sent by the
+    /// stream thread once the panel reports headroom; the rest wait for the
+    /// stream to end. Returns true if it was sent now.
+    fn send_control(
+        &self,
+        label: &'static str,
+        packet: Vec<u8>,
+        reply_wait: Duration,
+        play_safe: bool,
+    ) -> Result<bool> {
+        if self.transport.is_streaming() {
+            debug!("H2: {label} deferred — LCD streaming");
+            self.transport.defer(PendingCmd {
+                label,
+                packet,
+                reply_wait,
+                queued_at: std::time::Instant::now(),
+                play_safe,
+            });
+            return Ok(false);
+        }
+        let transport = self.transport.lock();
+        transport
+            .write_full(&packet, LCD_WRITE_TIMEOUT)
+            .with_context(|| format!("H2: {label} write"))?;
+        let mut buf = [0u8; 512];
+        let _ = transport.read(&mut buf, reply_wait);
+        Ok(true)
     }
 
     /// How long a GetH2Params reply is reused before going back to the wire.
@@ -233,16 +269,15 @@ impl H2AioController {
             fan_duties[1],
             fan_duties[2],
         );
-        let transport = self.transport.lock();
-        transport
-            .write(&header, LCD_WRITE_TIMEOUT)
-            .context("H2: SyncPumpFan write")?;
-        // FIX: give the reply enough time to arrive and be discarded here.
-        // At 50ms a slower answer stayed queued and poisoned the next read.
-        let mut buf = [0u8; 512];
-        let _ = transport.read(&mut buf, Duration::from_millis(250));
+        // Reply wait 250 ms: at 50 ms a slower answer stayed queued and
+        // poisoned the next read.
+        let sent = self.send_control("SyncPumpFan", header, Duration::from_millis(250), true)?;
         *self.last_sync.lock() = Some((std::time::Instant::now(), pump_pwm, fan_duties));
-        debug!("H2: SyncPumpFan pump_pwm={pump_pwm} fans={:?}", fan_duties);
+        debug!(
+            "H2: SyncPumpFan pump_pwm={pump_pwm} fans={:?}{}",
+            fan_duties,
+            if sent { "" } else { " (deferred)" }
+        );
         Ok(())
     }
 
@@ -278,22 +313,27 @@ impl H2AioController {
         packet.extend_from_slice(&header);
         packet.extend_from_slice(&payload);
 
-        let transport = self.transport.lock();
-        // FIX: this packet is a full 512-byte header plus the compressed RGB
-        // payload, so it is the only command here that exceeds one bulk packet.
-        // write() issues a single transfer and merely warns on a short write;
-        // write_full() loops until every byte is out. Every other command is
-        // exactly 512 bytes, which is why only RGB failed.
-        transport
-            .write_full(&packet, LCD_WRITE_TIMEOUT)
-            .context("H2: PushRgbData write")?;
-        let mut buf = [0u8; 512];
-        let _ = transport.read(&mut buf, Duration::from_millis(100));
+        // This packet is a full 512-byte header plus the compressed RGB payload,
+        // so it exceeds one bulk packet; send_control uses write_full so every
+        // byte goes out (a plain write() merely warned on the short write).
+        // Not play-safe: a PushRgbData during H.264 play mode hangs the panel
+        // even at buffer level 1 (2026-08-23) — presumably the firmware feeds
+        // the payload after the header to its stream parser. While the LCD
+        // streams, the ring is reachable over RF through the bridged wireless
+        // AIO instead; this frame is held until the stream ends.
+        let sent = self.send_control("PushRgbData", packet, Duration::from_millis(100), false)?;
+        if !sent {
+            tracing::warn!(
+                "H2: ring RGB held until the LCD stream ends (PushRgbData hangs the panel in play mode); \
+                 use the wireless pump-head device to recolour the ring while streaming"
+            );
+        }
         debug!(
-            "H2: PushRgbData {} frame(s), {} LEDs, {} bytes",
+            "H2: PushRgbData {} frame(s), {} LEDs, {} bytes{}",
             total_frames,
             RING_LED_COUNT,
-            payload.len()
+            payload.len(),
+            if sent { "" } else { " (deferred)" }
         );
         Ok(())
     }

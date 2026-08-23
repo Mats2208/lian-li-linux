@@ -137,4 +137,4 @@ pub fn open_device(family: DeviceFamily, ctx: &OpenContext) -> Option<Result<Ope
 /// spell out the full path.
 pub type SharedHid = Arc<Mutex<Box<dyn lianli_transport::HidTransport>>>;
 
-pub type SharedUsb = Arc<Mutex<lianli_transport::RusbBulk>>;
+pub type SharedUsb = crate::winusb::lcd::SharedTransport;

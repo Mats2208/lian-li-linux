@@ -17,8 +17,7 @@ fn sysfs_serial(bus: u8, address: u8) -> Option<String> {
         let (Some(b), Some(d)) = (rd("busnum"), rd("devnum")) else {
             continue;
         };
-        if b.trim().parse::<u8>().ok() != Some(bus)
-            || d.trim().parse::<u8>().ok() != Some(address)
+        if b.trim().parse::<u8>().ok() != Some(bus) || d.trim().parse::<u8>().ok() != Some(address)
         {
             continue;
         }

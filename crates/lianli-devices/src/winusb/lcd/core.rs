@@ -2,14 +2,116 @@ use crate::crypto::PacketBuilder;
 use anyhow::{bail, Context, Result};
 use lianli_shared::screen::ScreenInfo;
 use lianli_transport::usb::{RusbBulk, EP_IN, EP_OUT};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rusb::{Device, GlobalContext};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-pub type SharedTransport = Arc<Mutex<RusbBulk>>;
+/// A control command (SyncPumpFan, PushRgbData, …) that the H2 AIO channel
+/// handed to the LCD stream thread because the panel was busy ingesting
+/// H.264. Sent verbatim at the next safe point; the reply is read and
+/// discarded after `reply_wait`.
+pub struct PendingCmd {
+    pub label: &'static str,
+    pub packet: Vec<u8>,
+    pub reply_wait: Duration,
+    pub queued_at: Instant,
+    /// May this go out between chunks once the panel reports headroom? False
+    /// for commands that hang the panel in play mode regardless of buffer
+    /// level (PushRgbData — tested at levels 4 and 1, 2026-08-23); those wait
+    /// for the stream to end.
+    pub play_safe: bool,
+}
+
+/// USB bulk handle shared by the LCD stream and the HydroShift II control
+/// channel (pump/fan/ring RGB), plus the coordination that keeps control
+/// commands off the wire while the panel's ingest buffer is full.
+///
+/// Field evidence (usbmon, 2026-08-22/23): a SyncPumpFan or PushRgbData write
+/// landing while the panel reports buffer level 3–4 mid-stream hangs the MCU
+/// (bulk IN goes silent; sometimes EP0 dies too and only a power cycle helps).
+/// So while `streaming` is set, control writers queue their packet here and the
+/// stream thread — the only writer — flushes the queue once the panel reports
+/// headroom.
+pub struct LcdLink {
+    bulk: Mutex<RusbBulk>,
+    streaming: AtomicBool,
+    pending: Mutex<Vec<PendingCmd>>,
+}
+
+impl LcdLink {
+    pub fn new(bulk: RusbBulk) -> Self {
+        Self {
+            bulk: Mutex::new(bulk),
+            streaming: AtomicBool::new(false),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, RusbBulk> {
+        self.bulk.lock()
+    }
+
+    /// True while an H.264 stream is feeding the panel.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_streaming(&self, on: bool) {
+        self.streaming.store(on, Ordering::Release);
+    }
+
+    /// Queue a control command for the stream thread. Latest wins per label:
+    /// an older SyncPumpFan still waiting is replaced, not appended.
+    pub fn defer(&self, cmd: PendingCmd) {
+        let mut q = self.pending.lock();
+        q.retain(|c| c.label != cmd.label);
+        q.push(cmd);
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.lock().is_empty()
+    }
+
+    /// Take every queued command (stream over).
+    pub(crate) fn take_pending(&self) -> Vec<PendingCmd> {
+        std::mem::take(&mut *self.pending.lock())
+    }
+
+    /// Take only the commands that may be sent mid-stream.
+    pub(crate) fn take_play_safe(&self) -> Vec<PendingCmd> {
+        let mut q = self.pending.lock();
+        let (safe, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *q)
+            .into_iter()
+            .partition(|c| c.play_safe);
+        *q = rest;
+        safe
+    }
+
+    pub(crate) fn has_play_safe_pending(&self) -> bool {
+        self.pending.lock().iter().any(|c| c.play_safe)
+    }
+
+    pub(crate) fn oldest_play_safe_age(&self) -> Option<Duration> {
+        self.pending
+            .lock()
+            .iter()
+            .filter(|c| c.play_safe)
+            .map(|c| c.queued_at.elapsed())
+            .max()
+    }
+}
+
+pub type SharedTransport = Arc<LcdLink>;
+
+/// Buffer level at or below which queued control commands go out right away.
+const CONTROL_SAFE_LEVEL: u8 = 1;
+/// If the panel never drains that far, accept this level once a command has
+/// waited `CONTROL_RELAX_AFTER`.
+const CONTROL_RELAXED_LEVEL: u8 = 2;
+const CONTROL_RELAX_AFTER: Duration = Duration::from_secs(3);
 
 const REOPEN_DELAY: Duration = Duration::from_millis(100);
 const WAIT_BUFFER_POLL: Duration = Duration::from_millis(50);
@@ -30,7 +132,6 @@ pub(crate) struct WinUsbLcdCore {
     pub(crate) firmware: Option<String>,
 }
 
-
 /// Read the serial the kernel cached at enumeration, matching on bus/device
 /// number. Preferred over a live EP0 read: it cannot stall.
 fn sysfs_serial(bus: u8, address: u8) -> Option<String> {
@@ -41,8 +142,7 @@ fn sysfs_serial(bus: u8, address: u8) -> Option<String> {
         let (Some(b), Some(d)) = (rd("busnum"), rd("devnum")) else {
             continue;
         };
-        if b.trim().parse::<u8>().ok() != Some(bus)
-            || d.trim().parse::<u8>().ok() != Some(address)
+        if b.trim().parse::<u8>().ok() != Some(bus) || d.trim().parse::<u8>().ok() != Some(address)
         {
             continue;
         }
@@ -100,7 +200,7 @@ impl WinUsbLcdCore {
         );
 
         Ok(Self {
-            transport: Arc::new(Mutex::new(transport)),
+            transport: Arc::new(LcdLink::new(transport)),
             builder: PacketBuilder::new(),
             screen,
             write_timeout,
@@ -505,26 +605,68 @@ impl WinUsbLcdCore {
     /// `threshold` or less. When a `stop` flag is supplied (H264 streaming) it
     /// is honoured as the cancellation token; otherwise a safety cap prevents
     /// an indefinite hang on a wedged device.
-    pub(crate) fn wait_buffer(&mut self, threshold: u8, stop: Option<&AtomicBool>) {
+    ///
+    /// Returns the last buffer level read, if any.
+    pub(crate) fn wait_buffer(&mut self, threshold: u8, stop: Option<&AtomicBool>) -> Option<u8> {
         let mut iter = 0u32;
+        let mut last = None;
         loop {
             if let Some(s) = stop {
                 if s.load(Ordering::Relaxed) {
-                    return;
+                    return last;
                 }
             } else if iter >= WAIT_BUFFER_NO_STOP_CAP {
                 debug!("Buffer wait capped after {} polls", WAIT_BUFFER_NO_STOP_CAP);
-                return;
+                return last;
             }
             iter += 1;
             match self.query_buffer_level() {
-                Some(level) if level <= threshold => return,
-                Some(_) => std::thread::sleep(WAIT_BUFFER_POLL),
+                Some(level) if level <= threshold => return Some(level),
+                Some(level) => {
+                    last = Some(level);
+                    std::thread::sleep(WAIT_BUFFER_POLL)
+                }
                 None => {
                     debug!("Buffer wait aborted (no response)");
-                    return;
+                    return last;
                 }
             }
+        }
+    }
+
+    /// Send play-safe control commands queued by the H2 AIO channel while we
+    /// stream. Only called from the stream thread, which is the sole writer
+    /// while `streaming` is set, so each reply here belongs to the command
+    /// just sent.
+    fn flush_pending_control(&mut self, level: Option<u8>) {
+        if !self.transport.has_play_safe_pending() {
+            return;
+        }
+        let safe = match level {
+            Some(l) if l <= CONTROL_SAFE_LEVEL => true,
+            Some(l) if l <= CONTROL_RELAXED_LEVEL => self
+                .transport
+                .oldest_play_safe_age()
+                .is_some_and(|age| age >= CONTROL_RELAX_AFTER),
+            _ => false,
+        };
+        if !safe {
+            return;
+        }
+        for cmd in self.transport.take_play_safe() {
+            debug!(
+                "Sending deferred {} ({} bytes, waited {} ms, level {:?})",
+                cmd.label,
+                cmd.packet.len(),
+                cmd.queued_at.elapsed().as_millis(),
+                level
+            );
+            if let Err(e) = self.tx_write_full(&cmd.packet) {
+                warn!("Deferred {} write failed: {e}", cmd.label);
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            let _ = self.transport.lock().read(&mut buf, cmd.reply_wait);
         }
     }
 
@@ -556,12 +698,40 @@ impl WinUsbLcdCore {
         }
 
         let resp = self.read_response("h264 chunk");
+        let mut level = resp.map(|buf| buf[8]);
         if let Some(buf) = resp {
             if buf[8] > 3 {
-                self.wait_buffer(2, Some(stop));
+                level = self.wait_buffer(2, Some(stop)).or(level);
             }
         }
+        self.flush_pending_control(level);
         Ok(())
+    }
+
+    /// Mark the start of an H.264 stream: control writers defer to us.
+    fn stream_begin(&self) {
+        self.transport.set_streaming(true);
+    }
+
+    /// Mark the end of a stream. If it ended cleanly the panel is idle now, so
+    /// anything still queued goes out directly (bypassing the level check);
+    /// after an error the queue is dropped rather than hammering a device that
+    /// just stopped answering.
+    fn stream_end(&mut self, clean: bool) {
+        self.transport.set_streaming(false);
+        let pending = self.transport.take_pending();
+        if !clean {
+            return;
+        }
+        for cmd in pending {
+            debug!("Sending deferred {} after stream end", cmd.label);
+            if let Err(e) = self.tx_write_full(&cmd.packet) {
+                warn!("Deferred {} write failed: {e}", cmd.label);
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            let _ = self.transport.lock().read(&mut buf, cmd.reply_wait);
+        }
     }
 
     pub(crate) fn stream_h264(
@@ -573,15 +743,41 @@ impl WinUsbLcdCore {
         play_count: u8,
         play_tick: u32,
     ) -> Result<()> {
-        use std::io::{Read, Seek};
-
         let mut file = std::fs::File::open(path).context("opening h264 file")?;
         let mut file_buf = vec![0u8; self.h264_chunk_size];
         let interval = chunk_interval(fps);
         let mut next_deadline = Instant::now() + interval;
 
+        self.stream_begin();
+        let result = self.stream_h264_inner(
+            &mut file,
+            &mut file_buf,
+            looping,
+            stop,
+            interval,
+            &mut next_deadline,
+            play_count,
+            play_tick,
+        );
+        self.stream_end(result.is_ok());
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_h264_inner(
+        &mut self,
+        file: &mut std::fs::File,
+        file_buf: &mut [u8],
+        looping: bool,
+        stop: &AtomicBool,
+        interval: Duration,
+        next_deadline: &mut Instant,
+        play_count: u8,
+        play_tick: u32,
+    ) -> Result<()> {
+        use std::io::{Read, Seek};
         loop {
-            let n = file.read(&mut file_buf).context("reading h264 chunk")?;
+            let n = file.read(file_buf).context("reading h264 chunk")?;
             if n == 0 {
                 if looping && !stop.load(Ordering::Relaxed) {
                     file.seek(std::io::SeekFrom::Start(0))?;
@@ -598,7 +794,7 @@ impl WinUsbLcdCore {
                 pos >= len
             };
             self.send_h264_chunk(&file_buf[..n], is_last, play_count, play_tick, stop)?;
-            sleep_until(&mut next_deadline, interval);
+            sleep_until(next_deadline, interval);
         }
 
         self.tx_read_flush();
@@ -614,21 +810,26 @@ impl WinUsbLcdCore {
         play_tick: u32,
     ) -> Result<()> {
         let mut buf = vec![0u8; self.h264_chunk_size];
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                break;
+        self.stream_begin();
+        let result = (|| -> Result<()> {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = reader
+                    .read(&mut buf)
+                    .context("WinUSB LCD: read h264 stream")?;
+                if n == 0 {
+                    break;
+                }
+                self.send_h264_chunk(&buf[..n], false, play_count, play_tick, stop)?;
             }
-            let n = reader
-                .read(&mut buf)
-                .context("WinUSB LCD: read h264 stream")?;
-            if n == 0 {
-                break;
-            }
-            self.send_h264_chunk(&buf[..n], false, play_count, play_tick, stop)?;
-        }
+            Ok(())
+        })();
+        self.stream_end(result.is_ok());
         self.tx_read_flush();
         self.initialized = false;
-        Ok(())
+        result
     }
 
     pub(crate) fn init_logging(&self) {
