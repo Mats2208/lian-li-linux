@@ -69,8 +69,8 @@ pub struct H2AioController {
     /// two fields alternated between real data and zeros. One exchange feeds
     /// both within this window.
     params_cache: Mutex<Option<(std::time::Instant, H2Params)>>,
-    /// Last SyncPumpFan actually put on the wire: (when, pump_pwm, fan duties).
-    last_sync: Mutex<Option<(std::time::Instant, u16, [u8; 3])>>,
+    /// Last SyncPumpFan actually put on the wire: (when, pump duty, fan duties).
+    last_sync: Mutex<Option<(std::time::Instant, u8, [u8; 3])>>,
 }
 
 impl H2AioController {
@@ -222,7 +222,7 @@ impl H2AioController {
     }
 
     /// Send pump + fan PWM via SyncPumpFan (0xFB).
-    pub fn sync_pump_fan(&self, pump_pwm: u16, fan_duties: [u8; 3]) -> Result<()> {
+    pub fn sync_pump_fan(&self, pump_duty: u8, fan_duties: [u8; 3]) -> Result<()> {
         if self.is_wireless.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -252,7 +252,14 @@ impl H2AioController {
         {
             let last = self.last_sync.lock();
             if let Some((at, prev_pump, prev_fans)) = *last {
-                let changed = prev_pump != pump_pwm
+                // The pump needs the same deadband as the fans, and for the same
+                // reason: its duty comes from a curve evaluated every second and
+                // jitters by a point or two per tick. Comparing it exactly let
+                // every jittered tick through, which put the packet rate back
+                // where this gate exists to stop it. Compared in duty space so
+                // one threshold covers both, rather than in the pump's PWM
+                // period, whose scale is model-dependent and non-linear.
+                let changed = prev_pump.abs_diff(pump_duty) >= SIGNIFICANT_DUTY_STEP
                     || prev_fans
                         .iter()
                         .zip(fan_duties.iter())
@@ -262,6 +269,7 @@ impl H2AioController {
                 }
             }
         }
+        let pump_pwm = self.duty_to_pwm(pump_duty);
 
         let header = self.builder.lock().sync_pump_fan_header_winusb(
             pump_pwm,
@@ -272,7 +280,7 @@ impl H2AioController {
         // Reply wait 250 ms: at 50 ms a slower answer stayed queued and
         // poisoned the next read.
         let sent = self.send_control("SyncPumpFan", header, Duration::from_millis(250), true)?;
-        *self.last_sync.lock() = Some((std::time::Instant::now(), pump_pwm, fan_duties));
+        *self.last_sync.lock() = Some((std::time::Instant::now(), pump_duty, fan_duties));
         debug!(
             "H2: SyncPumpFan pump_pwm={pump_pwm} fans={:?}{}",
             fan_duties,
@@ -407,8 +415,7 @@ impl FanDevice for H2AioController {
         // hardware: raw byte 150 -> 1256 RPM (model RPM = 8.43 x byte, 0.6% error).
         duties[slot as usize % 3] = duty;
         *self.last_fan_duties.lock() = duties;
-        let pump_pwm = self.duty_to_pwm(*self.last_pump_duty.lock());
-        self.sync_pump_fan(pump_pwm, duties)
+        self.sync_pump_fan(*self.last_pump_duty.lock(), duties)
     }
 
     fn set_fan_speeds(&self, duties: &[u8]) -> Result<()> {
@@ -418,8 +425,7 @@ impl FanDevice for H2AioController {
             fan_duties[i] = d;
         }
         *self.last_fan_duties.lock() = fan_duties;
-        let pump_pwm = self.duty_to_pwm(*self.last_pump_duty.lock());
-        self.sync_pump_fan(pump_pwm, fan_duties)
+        self.sync_pump_fan(*self.last_pump_duty.lock(), fan_duties)
     }
 
     fn read_fan_rpm(&self) -> Result<Vec<u16>> {
@@ -447,9 +453,8 @@ impl FanDevice for H2AioController {
 
     fn set_pump_speed(&self, duty: u8) -> Result<()> {
         *self.last_pump_duty.lock() = duty;
-        let pump_pwm = self.duty_to_pwm(duty);
         let fans = *self.last_fan_duties.lock();
-        self.sync_pump_fan(pump_pwm, fans)
+        self.sync_pump_fan(duty, fans)
     }
 
     fn wireless_link_mac(&self) -> Option<[u8; 6]> {
