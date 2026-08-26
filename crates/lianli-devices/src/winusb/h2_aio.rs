@@ -71,6 +71,8 @@ pub struct H2AioController {
     params_cache: Mutex<Option<(std::time::Instant, H2Params)>>,
     /// Last SyncPumpFan actually put on the wire: (when, pump duty, fan duties).
     last_sync: Mutex<Option<(std::time::Instant, u8, [u8; 3])>>,
+    /// When the "telemetry held back while streaming" line was last logged.
+    stale_params_logged_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl H2AioController {
@@ -85,6 +87,7 @@ impl H2AioController {
             mac: Mutex::new(None),
             params_cache: Mutex::new(None),
             last_sync: Mutex::new(None),
+            stale_params_logged_at: Mutex::new(None),
         };
         wake(&transport);
         tracing::info!("HydroShift II control channel opened (shared transport)");
@@ -125,15 +128,54 @@ impl H2AioController {
                 queued_at: std::time::Instant::now(),
                 play_safe,
             });
+            // The stream can end between the check above and the queueing:
+            // stream_end() has then already drained the queue, and nothing
+            // would ever send this packet — it would sit there until the *next*
+            // stream ended and go out stale. Drain it here instead.
+            if !self.transport.is_streaming() {
+                self.send_stranded();
+            }
             return Ok(false);
         }
+        self.write_control(label, &packet, reply_wait)?;
+        Ok(true)
+    }
+
+    /// Write one control packet and discard its reply, holding the transport
+    /// across both halves so no other command's answer is consumed here.
+    fn write_control(&self, label: &str, packet: &[u8], reply_wait: Duration) -> Result<()> {
         let transport = self.transport.lock();
         transport
-            .write_full(&packet, LCD_WRITE_TIMEOUT)
+            .write_full(packet, LCD_WRITE_TIMEOUT)
             .with_context(|| format!("H2: {label} write"))?;
         let mut buf = [0u8; 512];
         let _ = transport.read(&mut buf, reply_wait);
-        Ok(true)
+        Ok(())
+    }
+
+    /// Send commands left in the queue by the teardown race above. The stream
+    /// is over, so these go straight out.
+    fn send_stranded(&self) {
+        for cmd in self.transport.take_pending() {
+            debug!("H2: sending {} stranded by stream teardown", cmd.label);
+            if let Err(e) = self.write_control(cmd.label, &cmd.packet, cmd.reply_wait) {
+                tracing::warn!("H2: stranded {} write failed: {e:#}", cmd.label);
+            }
+        }
+    }
+
+    /// Log held-back telemetry at most once every STALE_PARAMS_LOG_INTERVAL, so
+    /// a long stream does not fill the log with one line per poll.
+    fn note_stale_params(&self, age: Duration) {
+        const STALE_PARAMS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+        let mut last = self.stale_params_logged_at.lock();
+        if last.is_none_or(|at| at.elapsed() >= STALE_PARAMS_LOG_INTERVAL) {
+            debug!(
+                "H2: serving telemetry from cache ({} ms old) — LCD streaming",
+                age.as_millis()
+            );
+            *last = Some(std::time::Instant::now());
+        }
     }
 
     /// How long a GetH2Params reply is reused before going back to the wire.
@@ -146,6 +188,19 @@ impl H2AioController {
             if at.elapsed() < Self::PARAMS_CACHE_TTL {
                 return Ok(cached.clone());
             }
+        }
+        // A control write landing on a full ingest buffer hangs the MCU, which
+        // is why every command in send_control defers while the LCD streams.
+        // This one is a read, so there is nothing to queue — but it is the same
+        // 512-byte header on the same pipe, and on a cache miss it goes out
+        // twice. Hold the last reading instead: telemetry goes stale for the
+        // length of the stream, which is recoverable, and a wedged pump is not.
+        if self.transport.is_streaming() {
+            if let Some((at, cached)) = self.params_cache.lock().as_ref() {
+                self.note_stale_params(at.elapsed());
+                return Ok(cached.clone());
+            }
+            anyhow::bail!("H2: GetH2Params withheld — LCD streaming, no cached reading yet");
         }
         let header = self.builder.lock().get_h2_params_header_winusb();
 

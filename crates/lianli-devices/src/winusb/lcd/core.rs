@@ -661,13 +661,25 @@ impl WinUsbLcdCore {
                 cmd.queued_at.elapsed().as_millis(),
                 level
             );
-            if let Err(e) = self.tx_write_full(&cmd.packet) {
+            if let Err(e) = self.send_deferred(&cmd) {
                 warn!("Deferred {} write failed: {e}", cmd.label);
-                continue;
             }
-            let mut buf = [0u8; 512];
-            let _ = self.transport.lock().read(&mut buf, cmd.reply_wait);
         }
+    }
+
+    /// Write one deferred control packet and discard its reply, holding the
+    /// transport across both halves. Taking the lock twice would let another
+    /// exchange in between, and the reply read here would consume an answer
+    /// belonging to that command — the failure GetH2Params was made atomic for.
+    fn send_deferred(
+        &self,
+        cmd: &PendingCmd,
+    ) -> std::result::Result<(), lianli_transport::TransportError> {
+        let transport = self.transport.lock();
+        transport.write_full(&cmd.packet, self.write_timeout)?;
+        let mut buf = [0u8; 512];
+        let _ = transport.read(&mut buf, cmd.reply_wait);
+        Ok(())
     }
 
     fn send_h264_chunk(
@@ -725,12 +737,9 @@ impl WinUsbLcdCore {
         }
         for cmd in pending {
             debug!("Sending deferred {} after stream end", cmd.label);
-            if let Err(e) = self.tx_write_full(&cmd.packet) {
+            if let Err(e) = self.send_deferred(&cmd) {
                 warn!("Deferred {} write failed: {e}", cmd.label);
-                continue;
             }
-            let mut buf = [0u8; 512];
-            let _ = self.transport.lock().read(&mut buf, cmd.reply_wait);
         }
     }
 
