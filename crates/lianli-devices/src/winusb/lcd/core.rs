@@ -728,7 +728,13 @@ impl WinUsbLcdCore {
     }
 
     /// Mark the start of an H.264 stream: control writers defer to us.
+    /// The flag is flipped while holding the bulk mutex, and control
+    /// writers recheck it under the same mutex, so a writer that observed
+    /// not streaming either finishes its write before any stream chunk or
+    /// sees the flag flip and queues instead. It can never land a control
+    /// packet mid stream.
     fn stream_begin(&self) {
+        let _bulk = self.transport.lock();
         self.transport.set_streaming(true);
     }
 
@@ -737,7 +743,10 @@ impl WinUsbLcdCore {
     /// after an error the queue is dropped rather than hammering a device that
     /// just stopped answering.
     fn stream_end(&mut self, clean: bool) {
-        self.transport.set_streaming(false);
+        {
+            let _bulk = self.transport.lock();
+            self.transport.set_streaming(false);
+        }
         let pending = self.transport.take_pending();
         if !clean {
             return;

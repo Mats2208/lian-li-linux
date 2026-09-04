@@ -600,11 +600,16 @@ impl ActiveTarget {
             return;
         };
         let supports = guard.supports_c_command();
+        // Only a device that actually answered its firmware query gives a
+        // definitive no. When the read never succeeded the capability is
+        // unknown, and a later successful read by the firmware tracker
+        // must still be able to start recovery, so the retries continue.
+        let firmware_known = guard.firmware_version_str().is_some();
         drop(guard);
         if !supports {
             // Before init completes this only means the firmware is not
             // known yet. After it, the answer is definitive.
-            if self.init_complete {
+            if self.init_complete && firmware_known {
                 self.recovery_unsupported = true;
                 debug!(
                     "[devices] LCD[{}] firmware does not support recovery, stopping retries",

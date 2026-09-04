@@ -391,6 +391,12 @@ impl HydroShiftLcdController {
     }
 
     pub fn is_lcd_available(&self, stop: &AtomicBool) -> Result<bool> {
+        // Checked before the write too. A write against a wedged device can
+        // occupy the whole transfer timeout, which is exactly the budget of
+        // the bounded join waiting for this attempt to end.
+        if stop.load(Ordering::Relaxed) {
+            bail!("AIO LCD: availability check aborted before write (stop requested)");
+        }
         let mut dev = self.device.lock();
 
         let mut pkt = vec![0u8; B_PACKET_SIZE];
@@ -425,6 +431,13 @@ impl HydroShiftLcdController {
     pub fn reset_device(&self, stop: &AtomicBool) -> bool {
         const MAX_ATTEMPTS: u32 = 20;
 
+        // Checked before the write for the same reason as in
+        // is_lcd_available, the write itself can block for the full
+        // transfer timeout.
+        if stop.load(Ordering::Relaxed) {
+            warn!("AIO LCD: reset device aborted before write (stop requested)");
+            return false;
+        }
         let mut dev = self.device.lock();
         if let Err(e) = write_a_command_raw(&mut *dev, CMD_RESET_DEVICE, &[]) {
             warn!("AIO LCD: reset device failed: {e}");

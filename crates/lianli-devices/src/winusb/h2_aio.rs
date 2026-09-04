@@ -36,6 +36,8 @@ pub struct H2Params {
 
 /// After LCD play mode the device ignores control commands until this
 /// StopPlay → StopClock → GetVer preamble re-arms the channel.
+/// Skipped while the LCD streams, with the same transition guard as the
+/// other control writes, so re-arming never lands mid playback.
 fn wake(transport: &SharedTransport) {
     let mut builder = PacketBuilder::new();
     let cmds = [
@@ -45,6 +47,10 @@ fn wake(transport: &SharedTransport) {
     ];
     for cmd in &cmds {
         let t = transport.lock();
+        if transport.is_streaming() {
+            debug!("H2 control channel: wake skipped, LCD streaming");
+            return;
+        }
         let _ = t.write(cmd, LCD_WRITE_TIMEOUT);
         let mut buf = [0u8; 512];
         let _ = t.read(&mut buf, LCD_READ_TIMEOUT);
@@ -119,38 +125,48 @@ impl H2AioController {
         reply_wait: Duration,
         play_safe: bool,
     ) -> Result<bool> {
-        if self.transport.is_streaming() {
-            debug!("H2: {label} deferred — LCD streaming");
-            self.transport.defer(PendingCmd {
-                label,
-                packet,
-                reply_wait,
-                queued_at: std::time::Instant::now(),
-                play_safe,
-            });
-            // The stream can end between the check above and the queueing:
-            // stream_end() has then already drained the queue, and nothing
-            // would ever send this packet — it would sit there until the *next*
-            // stream ended and go out stale. Drain it here instead.
-            if !self.transport.is_streaming() {
-                self.send_stranded();
+        if !self.transport.is_streaming() {
+            // Not streaming at the check. The write rechecks the flag under
+            // the bulk mutex, the same mutex stream_begin holds while
+            // flipping it, so a stream beginning in between is caught
+            // before any byte reaches the pipe.
+            if self.write_control(label, &packet, reply_wait)? {
+                return Ok(true);
             }
-            return Ok(false);
         }
-        self.write_control(label, &packet, reply_wait)?;
-        Ok(true)
+        debug!("H2: {label} deferred — LCD streaming");
+        self.transport.defer(PendingCmd {
+            label,
+            packet,
+            reply_wait,
+            queued_at: std::time::Instant::now(),
+            play_safe,
+        });
+        // The stream can end between the check above and the queueing:
+        // stream_end() has then already drained the queue, and nothing
+        // would ever send this packet — it would sit there until the *next*
+        // stream ended and go out stale. Drain it here instead.
+        if !self.transport.is_streaming() {
+            self.send_stranded();
+        }
+        Ok(false)
     }
 
     /// Write one control packet and discard its reply, holding the transport
     /// across both halves so no other command's answer is consumed here.
-    fn write_control(&self, label: &str, packet: &[u8], reply_wait: Duration) -> Result<()> {
+    /// Returns false, nothing written, when a stream began while waiting
+    /// for the transport, so the caller must queue the command instead.
+    fn write_control(&self, label: &str, packet: &[u8], reply_wait: Duration) -> Result<bool> {
         let transport = self.transport.lock();
+        if self.transport.is_streaming() {
+            return Ok(false);
+        }
         transport
             .write_full(packet, LCD_WRITE_TIMEOUT)
             .with_context(|| format!("H2: {label} write"))?;
         let mut buf = [0u8; 512];
         let _ = transport.read(&mut buf, reply_wait);
-        Ok(())
+        Ok(true)
     }
 
     /// Send commands left in the queue by the teardown race above. The stream
@@ -158,8 +174,18 @@ impl H2AioController {
     fn send_stranded(&self) {
         for cmd in self.transport.take_pending() {
             debug!("H2: sending {} stranded by stream teardown", cmd.label);
-            if let Err(e) = self.write_control(cmd.label, &cmd.packet, cmd.reply_wait) {
-                tracing::warn!("H2: stranded {} write failed: {e:#}", cmd.label);
+            match self.write_control(cmd.label, &cmd.packet, cmd.reply_wait) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A new stream began before this could go out. Requeue
+                    // it so the new stream sends it at a safe point or its
+                    // teardown drains it, rather than losing the command.
+                    debug!("H2: requeueing {} until the new stream ends", cmd.label);
+                    self.transport.defer(cmd);
+                }
+                Err(e) => {
+                    tracing::warn!("H2: stranded {} write failed: {e:#}", cmd.label);
+                }
             }
         }
     }
@@ -216,6 +242,7 @@ impl H2AioController {
         let mut buf = [0u8; 512];
         let mut last_err: Option<anyhow::Error> = None;
         let mut got = false;
+        let mut stream_began = false;
         for attempt in 0..2 {
             let hdr = if attempt == 0 {
                 header.clone()
@@ -224,23 +251,43 @@ impl H2AioController {
             };
             let res = {
                 let transport = self.transport.lock();
-                transport
-                    .write(&hdr, LCD_WRITE_TIMEOUT)
-                    .context("H2: GetH2Params write")
-                    .and_then(|_| {
+                if self.transport.is_streaming() {
+                    // Same transition guard as write_control. The earlier
+                    // check passed, but a stream began before the lock was
+                    // acquired, so do not touch the pipe.
+                    stream_began = true;
+                    None
+                } else {
+                    Some(
                         transport
-                            .read(&mut buf, LCD_READ_TIMEOUT)
-                            .context("H2: GetH2Params read")
-                    })
+                            .write(&hdr, LCD_WRITE_TIMEOUT)
+                            .context("H2: GetH2Params write")
+                            .and_then(|_| {
+                                transport
+                                    .read(&mut buf, LCD_READ_TIMEOUT)
+                                    .context("H2: GetH2Params read")
+                            }),
+                    )
+                }
             };
             match res {
-                Ok(k) if k >= 32 => {
+                None => break,
+                Some(Ok(k)) if k >= 32 => {
                     got = true;
                     break;
                 }
-                Ok(k) => last_err = Some(anyhow::anyhow!("response too short ({k} bytes)")),
-                Err(e) => last_err = Some(e),
+                Some(Ok(k)) => last_err = Some(anyhow::anyhow!("response too short ({k} bytes)")),
+                Some(Err(e)) => last_err = Some(e),
             }
+        }
+        if stream_began {
+            // Serve the last reading rather than failing the poll, the
+            // stream will end and refresh it.
+            if let Some((at, cached)) = self.params_cache.lock().as_ref() {
+                self.note_stale_params(at.elapsed());
+                return Ok(cached.clone());
+            }
+            anyhow::bail!("H2: GetH2Params withheld — LCD streaming began mid exchange");
         }
         if !got {
             return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("H2: GetH2Params failed")));
