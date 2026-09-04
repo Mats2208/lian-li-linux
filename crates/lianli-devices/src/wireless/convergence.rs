@@ -154,6 +154,12 @@ fn drain_pending(
     health_map: &DeviceHealthMap,
     _stop: &Arc<AtomicBool>,
 ) {
+    // Retrying convergence is pointless once shutdown starts, since every
+    // transfer is refused on purpose. Leave the queue alone and let the
+    // loop end when its stop flag is raised.
+    if lianli_transport::usb::shutting_down() {
+        return;
+    }
     let mut guard = queue.lock();
     if guard.is_empty() {
         return;

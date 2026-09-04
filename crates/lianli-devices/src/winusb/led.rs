@@ -16,7 +16,7 @@ use lianli_transport::TransportError;
 use parking_lot::Mutex;
 use rusb::{Device, GlobalContext};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const LEDS_PER_CHUNK: usize = 20;
 const PACKET_SIZE: usize = 64;
@@ -81,6 +81,12 @@ impl WinUsbLedDevice {
         match first {
             Ok(()) => Ok(()),
             Err(e) => {
+                // Failures are expected once shutdown starts, since new
+                // transfers are refused. Do not warn or attempt a reopen.
+                if lianli_transport::usb::shutting_down() {
+                    debug!("{label} failed ({e}) while shutting down, not reopening");
+                    return Err(e);
+                }
                 warn!("{label} failed ({e}); attempting reopen");
                 self.reopen()?;
                 info!("{label} transport reopened, retrying");

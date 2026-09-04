@@ -240,7 +240,7 @@ impl WirelessController {
                 ) {
                     consecutive_errors += 1;
                     consecutive_successes = 0;
-                    info!("RX polling ({consecutive_errors}): {err:?}, continuing");
+                    info!("RX polling ({consecutive_errors}): {err:#}, continuing");
                     if consecutive_errors >= 5 {
                         total_resets += 1;
                         if total_resets > MAX_RESETS {

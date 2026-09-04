@@ -700,6 +700,13 @@ impl WinUsbLcdCore {
         match self.tx_write_full(&packet) {
             Ok(_) => self.note_write_success(),
             Err(e) => {
+                // The write is refused on purpose once shutdown starts, so
+                // unwinding quietly is the expected outcome, not a fault
+                // that recovery should chase.
+                if lianli_transport::usb::shutting_down() {
+                    debug!("H264 chunk write refused during shutdown: {e}");
+                    bail!("shutting down");
+                }
                 warn!("H264 chunk write failed: {e}");
                 self.try_recover()
                     .with_context(|| format!("recovering from h264 write error: {e}"))?;

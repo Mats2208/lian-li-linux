@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use lianli_transport::usb::RusbBulk;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Try to open a USB device matching any of the given VID:PID pairs.
 pub(super) fn open_any(ids: &[(u16, u16)]) -> Result<RusbBulk> {

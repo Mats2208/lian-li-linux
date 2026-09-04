@@ -122,11 +122,18 @@ impl RusbBulk {
                 self.claimed.push(0);
             }
             Err(rusb::Error::Busy) => {
+                // A busy interface is expected once shutdown starts, since
+                // handles are still held while their owners are being
+                // joined. Do not warn or sit through the retry loop.
+                if shutting_down() {
+                    debug!("{name} interface 0 busy while shutting down, not retrying");
+                    return Err(rusb::Error::Busy.into());
+                }
                 warn!("{name} interface 0 busy, retrying...");
                 let mut claimed = false;
                 for attempt in 1..=20u32 {
                     if shutting_down() {
-                        warn!("{name}: aborting interface claim, shutting down");
+                        debug!("{name}: aborting interface claim, shutting down");
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(250));

@@ -316,7 +316,11 @@ impl ThreadedWinUsbSender {
                 match msg {
                     LcdThreadMsg::Frame(data) => {
                         if let Err(e) = device.send_frame(&data) {
-                            warn!("LCD[{index}] sender thread frame error: {e}");
+                            if lianli_transport::usb::shutting_down() {
+                                debug!("LCD[{index}] frame send refused during shutdown: {e:#}");
+                            } else {
+                                warn!("LCD[{index}] sender thread frame error: {e}");
+                            }
                         }
                     }
                     LcdThreadMsg::FrameVerified(data, reply) => {
@@ -326,13 +330,21 @@ impl ThreadedWinUsbSender {
                     LcdThreadMsg::StreamH264 { path, looping, fps } => {
                         stop_clone.store(false, Ordering::Relaxed);
                         if let Err(e) = device.stream_h264(&path, looping, &stop_clone, fps) {
-                            warn!("LCD[{index}] h264 stream error: {e}");
+                            if lianli_transport::usb::shutting_down() {
+                                debug!("LCD[{index}] h264 stream ended by shutdown: {e:#}");
+                            } else {
+                                warn!("LCD[{index}] h264 stream error: {e}");
+                            }
                         }
                     }
                     LcdThreadMsg::StreamH264Reader(mut stdout, fps) => {
                         stop_clone.store(false, Ordering::Relaxed);
                         if let Err(e) = device.stream_h264_reader(&mut stdout, &stop_clone, fps) {
-                            warn!("LCD[{index}] h264 live stream error: {e}");
+                            if lianli_transport::usb::shutting_down() {
+                                debug!("LCD[{index}] h264 live stream ended by shutdown: {e:#}");
+                            } else {
+                                warn!("LCD[{index}] h264 live stream error: {e}");
+                            }
                         }
                     }
                     LcdThreadMsg::SwitchDesktop(reply) => {

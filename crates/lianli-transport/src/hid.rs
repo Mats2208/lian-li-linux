@@ -258,6 +258,12 @@ impl RusbHid {
         match op(self) {
             Ok(v) => Ok(v),
             Err(e) if self.reopener.is_some() => {
+                // Failures are expected once shutdown starts, since new
+                // transfers are refused. Do not warn or attempt a reopen.
+                if crate::usb::shutting_down() {
+                    debug!("RusbHid {label} failed ({e}) while shutting down, not reopening");
+                    return Err(e);
+                }
                 warn!("RusbHid {label} failed ({e}); attempting reopen");
                 self.try_reopen()?;
                 info!("RusbHid handle reopened, retrying {label}");
