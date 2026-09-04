@@ -172,7 +172,13 @@ impl ServiceManager {
                 return;
             }
         };
-        if current_topos != self.registry.last_wired_topos {
+        // Compare identities too, not just topology. A device replaced at
+        // the same port keeps its topology entry but gets a new id from
+        // its serial, and without this check the daemon would keep the
+        // stale backends forever and never open the replacement.
+        let topology_changed = current_topos != self.registry.last_wired_topos;
+        let identities_changed = current_ids != self.registry.last_wired_ids;
+        if topology_changed || identities_changed {
             let added = current_topos
                 .difference(&self.registry.last_wired_topos)
                 .count();
@@ -181,16 +187,29 @@ impl ServiceManager {
                 .last_wired_topos
                 .difference(&current_topos)
                 .count();
+            let id_added = current_ids
+                .difference(&self.registry.last_wired_ids)
+                .count();
+            let id_removed = self
+                .registry
+                .last_wired_ids
+                .difference(&current_ids)
+                .count();
             let now = std::time::Instant::now();
             const MIN_REINIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
             if let Some(last) = self.registry.last_reinit {
                 if now.duration_since(last) < MIN_REINIT_INTERVAL {
-                    debug!("Wired topology changed (+{added} -{removed}) but re-init rate-limited");
+                    debug!(
+                        "Wired device set changed (topology +{added} -{removed}, identity +{id_added} -{id_removed}) \
+                         but re-init rate-limited"
+                    );
                     return;
                 }
             }
             self.registry.last_reinit = Some(now);
-            info!("Wired device topology changed (+{added} -{removed}): re-initializing");
+            info!(
+                "Wired device set changed (topology +{added} -{removed}, identity +{id_added} -{id_removed}): re-initializing"
+            );
 
             // stop controllers first, they hold Arcs into fan_devices
             if let Some(controller) = self.controllers.fan.take() {

@@ -384,7 +384,8 @@ impl ServiceManager {
                                 let enable_512 = device_cfg.aio_512_frame_for(candidate.family);
                                 let device_id = candidate.device_id.clone();
                                 let init_tx = self.tx.clone();
-                                std::thread::Builder::new()
+                                let spawn_err_id = device_id.clone();
+                                if let Err(e) = std::thread::Builder::new()
                                     .name(format!("lcd-init-{device_id}"))
                                     .spawn(move || {
                                         let mut guard = hid_init.lock();
@@ -398,7 +399,15 @@ impl ServiceManager {
                                                 .ok();
                                         }
                                     })
-                                    .ok();
+                                {
+                                    // Without the worker LcdInitComplete never
+                                    // fires, so say why instead of failing
+                                    // silently and leaving the LCD
+                                    // uninitialized with no trace in the log.
+                                    warn!(
+                                        "Failed to spawn AIO LCD init thread for {spawn_err_id}: {e}"
+                                    );
+                                }
                                 self.aio_lcd_firmware
                                     .record(&candidate.device_id, None, false);
                                 if !self.aio_lcd_firmware.should_skip(&candidate.device_id) {
@@ -433,13 +442,15 @@ impl ServiceManager {
                         new_targets.insert(cfg_idx, target);
                         if let Some(brightness) = device_cfg.brightness {
                             if let Some(t) = new_targets.get_mut(&cfg_idx) {
-                                if let Err(e) = t.lcd.set_brightness(
+                                // Bounded so the main loop cannot stall behind
+                                // the init worker holding the LCD mutex. When
+                                // the LCD is busy the value is deferred and
+                                // applied once init completes.
+                                t.apply_brightness(
                                     Some(&self.wireless),
                                     &mut self.packet_builder,
                                     brightness,
-                                ) {
-                                    warn!("Failed to apply LCD brightness for LCD[{cfg_idx}]: {e}");
-                                }
+                                );
                             }
                         }
                         if let Some(ref tx) = self.tx {

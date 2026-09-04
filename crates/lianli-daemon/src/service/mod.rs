@@ -298,6 +298,18 @@ impl ServiceManager {
         self.check_wired_hotplug();
         self.reconcile_wired_wireless_binding();
         self.refresh_targets();
+
+        // Retry starting LCD recovery threads that were skipped because the
+        // LCD mutex was busy at creation or init completion. The zero wait
+        // keeps this cheap for targets that have nothing to do.
+        {
+            let tx = self.tx.clone();
+            let mut targets = self.targets.lock();
+            for target in targets.values_mut() {
+                target.maybe_start_recovery(tx.clone(), Duration::ZERO);
+            }
+        }
+
         self.process_pending_lcd_firmware();
         self.check_thermal_alert();
         self.sync_ipc_telemetry();
@@ -470,7 +482,6 @@ impl ServiceManager {
 
         SysSensor::init();
 
-
         let shutdown_tx = tx.clone();
         thread::spawn(move || {
             use signal_hook::consts::{SIGINT, SIGTERM};
@@ -506,6 +517,12 @@ impl ServiceManager {
                             return;
                         }
                         thread::sleep(Duration::from_millis(100));
+                    }
+                    // The final sleep can end just after the deadline even
+                    // when shutdown finished during it, so check the flag
+                    // once more before forcing the process down.
+                    if SHUTDOWN_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
                     }
                     warn!(
                         "shutdown exceeded {}s grace period, forcing exit — \
@@ -688,13 +705,21 @@ impl ServiceManager {
                     // firmware state is now recorded by the init worker;
                     // start the recovery thread if the target was created
                     // before init finished. Idempotent, no teardown.
+                    // Answers from the device are definitive now, and any
+                    // brightness deferred while the init worker held the
+                    // LCD can be applied.
                     let tx = self.tx.clone();
                     let mut targets = self.targets.lock();
                     if let Some((_, target)) = targets
                         .iter_mut()
                         .find(|(_, t)| t.device_identity == device_id)
                     {
-                        target.maybe_start_recovery(tx);
+                        target.mark_init_complete();
+                        target.maybe_start_recovery(tx, Duration::from_millis(200));
+                        target.flush_pending_brightness(
+                            Some(&self.wireless),
+                            &mut self.packet_builder,
+                        );
                     }
                 }
                 DaemonEvent::RebootWirelessLcd { mac } => {

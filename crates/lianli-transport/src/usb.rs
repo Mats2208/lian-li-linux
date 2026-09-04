@@ -32,8 +32,7 @@ pub const LCD_READ_TIMEOUT: Duration = Duration::from_millis(2_000);
 /// poll it so a worker thread never sits inside a multi-second USB retry while
 /// `shutdown()` is blocked joining it — that stall is what forced the process
 /// to exit with a transfer still in flight, which hangs the device MCU.
-pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// True once shutdown has begun; long loops must bail out promptly.
 pub fn shutting_down() -> bool {

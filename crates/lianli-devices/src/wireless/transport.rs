@@ -50,6 +50,13 @@ where
     match first {
         Ok(r) => Ok(r),
         Err(e) => {
+            // Failures are expected once shutdown starts, since new
+            // transfers are refused. Do not warn or attempt a reopen, the
+            // caller is about to be joined anyway.
+            if lianli_transport::usb::shutting_down() {
+                debug!("{name} transport op failed ({e}) while shutting down, not reopening");
+                return Err(e).context("shutting down");
+            }
             warn!("{name} transport op failed ({e}); attempting reopen");
             reopen_transport(arc, ids, name).context("reopen after stale handle")?;
             info!("{name} transport reopened, retrying");

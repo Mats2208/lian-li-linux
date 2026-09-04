@@ -114,6 +114,23 @@ pub(super) enum LcdBackend {
     HidLcd(SharedHidLcd),
 }
 
+/// The LCD mutex could not be taken within the bounded wait, meaning the
+/// init worker is holding it across its long settle and firmware retries.
+/// Frame sends treat it as a retry later rather than an error so the
+/// streaming thread never tears down a target that is merely initializing.
+#[derive(Debug)]
+struct LcdBusy;
+
+impl std::fmt::Display for LcdBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LCD busy (initializing)")
+    }
+}
+impl std::error::Error for LcdBusy {}
+
+/// How long a frame send waits for the LCD mutex before deferring.
+const LCD_BUSY_WAIT: Duration = Duration::from_millis(100);
+
 impl LcdBackend {
     fn send_frame(
         &mut self,
@@ -129,7 +146,12 @@ impl LcdBackend {
                 d.send_frame(builder, frame)
             }
             Self::WinUsb(d) => d.send_frame(frame),
-            Self::HidLcd(d) => d.lock().send_jpeg_frame(frame),
+            Self::HidLcd(d) => {
+                let Some(mut guard) = d.try_lock_for(LCD_BUSY_WAIT) else {
+                    return Err(LcdBusy.into());
+                };
+                guard.send_jpeg_frame(frame)
+            }
         }
     }
 
@@ -141,7 +163,12 @@ impl LcdBackend {
     ) -> anyhow::Result<()> {
         match self {
             Self::WinUsb(d) => d.send_frame_verified(frame),
-            Self::HidLcd(d) => d.lock().send_static_frame(frame),
+            Self::HidLcd(d) => {
+                let Some(mut guard) = d.try_lock_for(LCD_BUSY_WAIT) else {
+                    return Err(LcdBusy.into());
+                };
+                guard.send_static_frame(frame)
+            }
             _ => self.send_frame(wireless, builder, frame),
         }
     }
@@ -436,6 +463,16 @@ pub(crate) struct ActiveTarget {
     pub(super) consecutive_errors: u32,
     recovery_stop: Arc<AtomicBool>,
     recovery_thread: Option<JoinHandle<()>>,
+    /// Set once the init worker reports LcdInitComplete for this device.
+    /// Before it, a false answer from supports_c_command only means the
+    /// firmware is not known yet and must be retried later.
+    init_complete: bool,
+    /// Set when the device definitively does not support recovery, so the
+    /// periodic retry stops probing it.
+    recovery_unsupported: bool,
+    /// Brightness that could not be applied because the init worker held
+    /// the LCD. Applied when init completes.
+    pending_brightness: Option<u8>,
 }
 
 fn spawn_recovery_thread(
@@ -455,7 +492,7 @@ fn spawn_recovery_thread(
             let Some(mut guard) = lcd.try_lock_for(Duration::from_secs(2)) else {
                 continue;
             };
-            match guard.check_and_recover_lcd() {
+            match guard.check_and_recover_lcd(&stop) {
                 Ok(RecoveryAction::Recovered) => {
                     if let Some(tx) = &tx {
                         if !stop.load(Ordering::Relaxed) {
@@ -523,24 +560,45 @@ impl ActiveTarget {
             consecutive_errors: 0,
             recovery_stop,
             recovery_thread,
+            init_complete: false,
+            recovery_unsupported: false,
+            pending_brightness: None,
         }
     }
 
     /// Start the recovery thread if it is missing and the device now
-    /// reports c-command support. Called from `new` (firmware may already
-    /// be known) and after `LcdInitComplete` (firmware recorded by the
-    /// init worker after the target was created).
-    pub(super) fn maybe_start_recovery(&mut self, tx: Option<Sender<DaemonEvent>>) {
-        if self.recovery_thread.is_some() {
+    /// reports c-command support. Called from new, where firmware may
+    /// already be known, after LcdInitComplete, and from the periodic
+    /// device poll with a zero wait so a busy LCD is retried later
+    /// instead of disabling recovery for the whole session.
+    pub(super) fn maybe_start_recovery(&mut self, tx: Option<Sender<DaemonEvent>>, wait: Duration) {
+        if self.recovery_thread.is_some() || self.recovery_unsupported {
             return;
         }
         let LcdBackend::HidLcd(d) = &self.lcd else {
             return;
         };
-        let supports = d
-            .try_lock_for(Duration::from_millis(200))
-            .is_some_and(|guard| guard.supports_c_command());
+        let Some(guard) = d.try_lock_for(wait) else {
+            if wait > Duration::ZERO {
+                debug!(
+                    "[devices] LCD[{}] busy, will retry starting recovery thread",
+                    self.device_identity
+                );
+            }
+            return;
+        };
+        let supports = guard.supports_c_command();
+        drop(guard);
         if !supports {
+            // Before init completes this only means the firmware is not
+            // known yet. After it, the answer is definitive.
+            if self.init_complete {
+                self.recovery_unsupported = true;
+                debug!(
+                    "[devices] LCD[{}] firmware does not support recovery, stopping retries",
+                    self.device_identity
+                );
+            }
             return;
         }
         info!(
@@ -554,6 +612,72 @@ impl ActiveTarget {
             self.device_identity.clone(),
             tx,
         ));
+    }
+
+    /// The init worker finished, so answers from the device are now
+    /// definitive and deferred work can be applied.
+    pub(super) fn mark_init_complete(&mut self) {
+        self.init_complete = true;
+    }
+
+    /// Apply brightness now when the LCD is free, otherwise remember it
+    /// for when init completes. The init worker holds the LCD mutex across
+    /// its whole settle and firmware retry window, so an unbounded lock
+    /// here would stall the main loop for that entire duration.
+    pub(super) fn apply_brightness(
+        &mut self,
+        wireless: Option<&WirelessController>,
+        builder: &mut PacketBuilder,
+        brightness: u8,
+    ) {
+        if let LcdBackend::HidLcd(d) = &self.lcd {
+            match d.try_lock_for(Duration::from_millis(500)) {
+                None => {
+                    debug!(
+                        "[devices] LCD[{}] initializing, brightness deferred",
+                        self.index
+                    );
+                    self.pending_brightness = Some(brightness);
+                }
+                Some(guard) => {
+                    if let Err(e) = guard.set_brightness(brightness) {
+                        warn!(
+                            "Failed to apply LCD brightness for LCD[{}]: {e:#}",
+                            self.index
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        if let Err(e) = self.lcd.set_brightness(wireless, builder, brightness) {
+            warn!(
+                "Failed to apply LCD brightness for LCD[{}]: {e:#}",
+                self.index
+            );
+        }
+    }
+
+    /// Apply a brightness that was deferred while the LCD was initializing.
+    /// Called once init completed, so an unbounded lock is safe here.
+    pub(super) fn flush_pending_brightness(
+        &mut self,
+        wireless: Option<&WirelessController>,
+        builder: &mut PacketBuilder,
+    ) {
+        let Some(brightness) = self.pending_brightness.take() else {
+            return;
+        };
+        info!(
+            "[devices] LCD[{}] applying deferred brightness {brightness}",
+            self.index
+        );
+        if let Err(e) = self.lcd.set_brightness(wireless, builder, brightness) {
+            warn!(
+                "Failed to apply LCD brightness for LCD[{}]: {e:#}",
+                self.index
+            );
+        }
     }
 
     pub(super) fn matches(&self, identity: &str, key: &ConfigKey) -> bool {
@@ -626,12 +750,26 @@ impl ActiveTarget {
         } else {
             self.lcd.send_frame(wireless, builder, frame)
         };
-        result.map_err(
-            |err| match err.downcast::<lianli_transport::TransportError>() {
-                Ok(usb) => SendError::Usb(usb),
-                Err(other) => SendError::Other(other),
-            },
-        )?;
+        match result {
+            Ok(()) => {}
+            // The init worker holds the LCD for its whole settle window.
+            // Report nothing sent so the version check retries next tick
+            // instead of counting an error toward target recreation.
+            Err(e) if e.downcast_ref::<LcdBusy>().is_some() => {
+                debug!(
+                    "[devices] LCD[{}] initializing, deferring frame send",
+                    self.index
+                );
+                return Ok(false);
+            }
+            Err(err) => {
+                let send_err = match err.downcast::<lianli_transport::TransportError>() {
+                    Ok(usb) => SendError::Usb(usb),
+                    Err(other) => SendError::Other(other),
+                };
+                return Err(send_err);
+            }
+        }
 
         self.frame_counter += 1;
         Ok(true)

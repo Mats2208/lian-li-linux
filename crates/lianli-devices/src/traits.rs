@@ -1,6 +1,7 @@
 use anyhow::Result;
 use lianli_shared::rgb::{RgbEffect, RgbMode, RgbScope, RgbZoneInfo};
 use lianli_shared::screen::ScreenInfo;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// A device that can control fan speeds.
@@ -200,7 +201,12 @@ pub trait LcdDevice: Send + Sync {
     fn set_brightness(&self, brightness: u8) -> Result<()>;
     fn set_rotation(&self, degrees: u16) -> Result<()>;
     fn initialize(&mut self) -> Result<()>;
-    fn check_and_recover_lcd(&mut self) -> Result<RecoveryAction> {
+    /// The stop flag is polled between USB exchanges so a recovery attempt
+    /// in flight aborts promptly when the owning target is torn down.
+    /// Without it a single attempt can hold the device for over twenty
+    /// seconds of reset retries, far past the bounded join in the teardown
+    /// path.
+    fn check_and_recover_lcd(&mut self, _stop: &AtomicBool) -> Result<RecoveryAction> {
         Ok(RecoveryAction::NoChange)
     }
     fn supports_c_command(&self) -> bool {

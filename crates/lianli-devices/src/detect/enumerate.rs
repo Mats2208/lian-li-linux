@@ -2,10 +2,26 @@ use super::DetectedDevice;
 use anyhow::Result;
 use lianli_shared::config::HidBackend;
 use lianli_shared::device_id::{DeviceFamily, UsbId, KNOWN_DEVICES};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use tracing::{debug, warn};
 
 /// Enumerate all Lian Li USB devices on the system, sorted by (bus, address).
+
+/// Devices whose live EP0 serial probe already failed once. The enumeration
+/// runs every poll, so without this cache a device that has no kernel cached
+/// serial and does not answer string descriptor requests would be probed
+/// once a second, which is exactly the pattern that wedges some controllers.
+/// A replugged healthy device gets its serial cached by the kernel and is
+/// served from sysfs, so a stale entry here is never consulted for it.
+type Ep0SerialKey = (u16, u16, u8, u8);
+type Ep0SerialFailures = Mutex<HashSet<Ep0SerialKey>>;
+
+static EP0_SERIAL_FAILED: OnceLock<Ep0SerialFailures> = OnceLock::new();
+
+fn ep0_serial_failed() -> &'static Ep0SerialFailures {
+    EP0_SERIAL_FAILED.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 /// Serial the kernel cached at enumeration, matched on bus/device number.
 /// Cheap file read, and unlike an EP0 request it cannot stall or upset a
@@ -68,10 +84,26 @@ pub fn enumerate_devices() -> Result<Vec<DetectedDevice>> {
             // nothing logged. Driving the same device from a script that never
             // enumerates ran 180s without a single failure.
             let serial = sysfs_serial(bus, address).or_else(|| {
-                device
+                let key = (vid, pid, bus, address);
+                let mut failed = ep0_serial_failed()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if failed.contains(&key) {
+                    return None;
+                }
+                let got = device
                     .open()
                     .ok()
-                    .and_then(|h| h.read_serial_number_string_ascii(&desc).ok())
+                    .and_then(|h| h.read_serial_number_string_ascii(&desc).ok());
+                if got.is_none() {
+                    failed.insert(key);
+                    debug!(
+                        "{:04x}:{:04x} at bus {} addr {} answered neither sysfs nor EP0 serial, \
+                         caching the negative result",
+                        vid, pid, bus, address
+                    );
+                }
+                got
             });
 
             debug!(
