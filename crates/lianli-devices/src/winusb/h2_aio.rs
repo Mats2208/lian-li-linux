@@ -260,7 +260,7 @@ impl H2AioController {
                 } else {
                     Some(
                         transport
-                            .write(&hdr, LCD_WRITE_TIMEOUT)
+                            .write_full(&hdr, LCD_WRITE_TIMEOUT)
                             .context("H2: GetH2Params write")
                             .and_then(|_| {
                                 transport
