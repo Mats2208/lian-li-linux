@@ -1,18 +1,20 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { Copy, Save, X } from "lucide-vue-next";
+import { Copy, Image as ImageIcon, Palette, Save, X } from "lucide-vue-next";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import type { LcdTemplate, Widget, Widget as W } from "@/types";
+import type { LcdTemplate, Widget, Widget as W, RGBA, RGB, SensorSourceConfig } from "@/types";
 import { useConfigStore } from "@/stores/config";
 import { useLcdStore } from "@/stores/lcd";
 import { useFonts } from "@/composables/useFonts";
 import WidgetList from "@/components/editor/WidgetList.vue";
 import WidgetCanvas from "@/components/editor/WidgetCanvas.vue";
 import PropertiesPanel from "@/components/editor/PropertiesPanel.vue";
+import ColorPicker from "@/components/rgb/ColorPicker.vue";
 import { screenPresets } from "@/constants/screen";
-import { enumerateSensorsAsOptions } from "@/stores/sensorOptions";
+import { enumerateSensorsAsOptions, inferSensorCategory } from "@/stores/sensorOptions";
 
 const config = useConfigStore();
 const lcd = useLcdStore();
@@ -26,9 +28,32 @@ const statusIsError = ref(false);
 
 const renderPreview = lcd.renderPreview();
 
-const sensorOptions = computed(() => enumerateSensorsAsOptions(config.sensors, false));
+const sensorOptions = computed(() => enumerateSensorsAsOptions(config.sensors, true));
 
-const presetOptions = screenPresets.map((p) => ({ label: p.label, value: `${p.width}x${p.height}` }));
+const presetOptions = screenPresets.map((p) => ({ label: p.label, value: p.label }));
+
+const currentPresetLabel = computed<string | null>(() => {
+  const t = template.value;
+  if (!t) return null;
+  if (t.target_device && screenPresets.some((p) => p.label === t.target_device)) {
+    return t.target_device;
+  }
+  return (
+    screenPresets.find((p) => p.width === t.base_width && p.height === t.base_height)?.label ?? null
+  );
+});
+
+function onPresetSelected(label: string) {
+  const preset = screenPresets.find((p) => p.label === label);
+  const tpl = template.value;
+  if (!preset || !tpl) return;
+  tpl.base_width = preset.width;
+  tpl.base_height = preset.height;
+  tpl.target_device = preset.label;
+  if (preset.width === preset.height) {
+    tpl.rotated = false;
+  }
+}
 
 /**
  * Load the template identified by `?template=<id>`. The "New" button opens
@@ -41,6 +66,9 @@ function loadRequestedTemplate(id: string | (string | null)[] | null) {
   const tid = Array.isArray(id) ? id[0] : id;
   const match = tid ? config.templates.find((t) => t.id === tid) : undefined;
   template.value = match ? (JSON.parse(JSON.stringify(match)) as LcdTemplate) : blankTemplate();
+  if (template.value.background.type === "color") {
+    lastBgColor.value = [...template.value.background.rgb] as RGBA;
+  }
   selectedId.value = null;
   triggerPreview();
 }
@@ -64,10 +92,19 @@ onUnmounted(() => {
   window.removeEventListener("keydown", onKeyDown);
 });
 
+function uniqueTemplateName(base: string): string {
+  const inUse = (c: string) => config.templates.some((t) => t.name === c);
+  if (!inUse(base)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base} ${n}`;
+    if (!inUse(candidate)) return candidate;
+  }
+}
+
 function blankTemplate(): LcdTemplate {
   return {
     id: "user-" + Date.now().toString(16),
-    name: "New Template",
+    name: uniqueTemplateName("New Template"),
     base_width: 480,
     base_height: 480,
     background: { type: "color", rgb: [0, 0, 0, 255] },
@@ -116,6 +153,32 @@ function onRotated(v: boolean) {
   }
   tpl.rotated = v;
   triggerPreview();
+}
+
+const lastBgColor = ref<RGBA>([0, 0, 0, 255]);
+
+const bgType = computed(() => template.value?.background.type ?? "color");
+
+function onBgColor(v: RGB | RGBA) {
+  const rgba: RGBA = [v[0], v[1], v[2], v.length === 4 ? v[3] : 255];
+  lastBgColor.value = rgba;
+  if (template.value) template.value.background = { type: "color", rgb: rgba };
+}
+
+function setBgColorMode() {
+  const tpl = template.value;
+  if (tpl && tpl.background.type !== "color") {
+    tpl.background = { type: "color", rgb: [...lastBgColor.value] as RGBA };
+  }
+}
+
+async function pickBgImage() {
+  const sel = await open({
+    filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "bmp"] }],
+  });
+  if (typeof sel === "string" && template.value) {
+    template.value.background = { type: "image", path: sel };
+  }
 }
 
 const selectedWidget = computed<Widget | null>(
@@ -325,9 +388,23 @@ function triggerPreview() {
 
 watch(template, () => triggerPreview(), { deep: true });
 
+function portablizeForExport(tpl: LcdTemplate): LcdTemplate {
+  const out = JSON.parse(JSON.stringify(tpl)) as LcdTemplate;
+  for (const w of out.widgets) {
+    const src = (w.kind as any)?.source as SensorSourceConfig | undefined;
+    if (!src || w.sensor_category) continue;
+    const cat = inferSensorCategory(src);
+    if (cat) {
+      w.sensor_category = cat;
+      (w.kind as any).source = { type: "cpu_usage" };
+    }
+  }
+  return out;
+}
+
 async function onCopyJson() {
   if (!template.value) return;
-  const json = JSON.stringify(template.value, null, 2);
+  const json = JSON.stringify(portablizeForExport(template.value), null, 2);
   try {
     await writeText(json);
     setStatus("Template JSON copied to clipboard", false);
@@ -338,6 +415,18 @@ async function onCopyJson() {
 
 async function onSave() {
   if (!template.value) return;
+  if (!template.value.name.trim()) {
+    setStatus("Template name must not be empty", true);
+    return;
+  }
+  if (
+    config.templates.some(
+      (t) => t.id !== template.value!.id && t.name === template.value!.name,
+    )
+  ) {
+    setStatus(`A template named '${template.value.name}' already exists.`, true);
+    return;
+  }
   const idx = config.templates.findIndex((t) => t.id === template.value!.id);
   if (idx >= 0) {
     config.templates[idx] = JSON.parse(JSON.stringify(template.value));
@@ -380,13 +469,32 @@ function commitName() {
     <div class="toolbar">
       <n-input v-model:value="localName" @blur="commitName" size="small" style="width: 220px" placeholder="Template name" />
       <n-select
-        :value="`${template?.base_width ?? 480}x${template?.base_height ?? 480}`"
+        :value="currentPresetLabel"
         :options="presetOptions"
         size="small"
-        style="width: 200px"
-        @update:value="(v: string) => { const [w, h] = v.split('x').map(Number); if (template) { template.base_width = w; template.base_height = h; } }"
+        style="width: 260px"
+        placeholder="Target device"
+        @update:value="onPresetSelected"
       />
       <n-checkbox :checked="template?.rotated ?? false" @update:checked="onRotated">Rotated</n-checkbox>
+      <div class="bg-group">
+        <n-button size="tiny" :type="bgType === 'color' ? 'primary' : 'default'" :ghost="bgType !== 'color'" @click="setBgColorMode">
+          <template #icon><Palette :size="12" /></template>Color
+        </n-button>
+        <n-button size="tiny" :type="bgType === 'image' ? 'primary' : 'default'" :ghost="bgType !== 'image'" @click="pickBgImage">
+          <template #icon><ImageIcon :size="12" /></template>Image
+        </n-button>
+        <ColorPicker
+          v-if="bgType === 'color'"
+          class="bg-picker"
+          :model-value="template?.background.type === 'color' ? template.background.rgb : lastBgColor"
+          :alpha="true"
+          @update:model-value="onBgColor"
+        />
+        <span v-else-if="template?.background.type === 'image'" class="bg-path mono" :title="template.background.path">
+          {{ template.background.path.split("/").pop() }}
+        </span>
+      </div>
       <div class="spacer" />
       <span v-if="statusMessage" class="status" :class="{ err: statusIsError }">{{ statusMessage }}</span>
       <n-button size="small" @click="onCopyJson"><template #icon><Copy :size="14" /></template>Copy JSON</n-button>
@@ -448,6 +556,25 @@ function commitName() {
 }
 .spacer {
   flex: 1;
+}
+.bg-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.bg-picker {
+  width: 64px;
+}
+.bg-picker :deep(.n-color-pickerTrigger) {
+  height: 24px;
+}
+.bg-path {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
 }
 .status {
   font-size: var(--font-size-sm);

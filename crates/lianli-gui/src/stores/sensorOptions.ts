@@ -84,3 +84,38 @@ export function optionForConfig(
   const json = JSON.stringify(cfg);
   return sensors.some((s) => JSON.stringify(s.source) === json) ? json : "";
 }
+
+export function inferSensorCategory(src: SensorSourceConfig): string | null {
+  switch (src.type) {
+    case "cpu_usage":
+      return "cpu_usage";
+    case "mem_usage":
+      return "mem_usage";
+    case "mem_used":
+      return "mem_used";
+    case "mem_free":
+      return "mem_free";
+    case "nvidia_gpu":
+      return src.metric === "usage" ? "gpu_usage" : "gpu_temp";
+    case "amd_gpu_usage":
+      return "gpu_usage";
+    case "network_rx":
+      return "network_rx";
+    case "network_tx":
+      return "network_tx";
+    case "disk_read":
+      return "disk_read";
+    case "disk_write":
+      return "disk_write";
+    case "hwmon": {
+      const l = src.label.toLowerCase();
+      if (src.name === "k10temp" || src.name === "coretemp") return "cpu_temp";
+      if ((src.name === "amdgpu" || src.name === "radeon") && (l.includes("edge") || l.includes("temp"))) {
+        return "gpu_temp";
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+}

@@ -173,12 +173,35 @@ function sourceLabel(src: SensorSourceConfig | null | undefined): string {
 
 function sourceOptionsFor(key: string) {
   const src = (current.value.kind as any)[key] as SensorSourceConfig | undefined;
-  const json = src ? JSON.stringify(src) : "";
   const opts = [...props.sensorOptions];
+  if (src?.type === "command") return opts;
+  const json = src ? JSON.stringify(src) : "";
   if (json && !opts.some((o) => o.value === json)) {
     opts.unshift({ label: sourceLabel(src), value: json });
   }
   return opts;
+}
+
+function sourceSelectValue(key: string): string {
+  const src = (current.value.kind as any)[key] as SensorSourceConfig | undefined;
+  if (src?.type === "command") return "command";
+  return src ? JSON.stringify(src) : "";
+}
+
+function onSourceSelect(key: string, v: string) {
+  if (v === "command") {
+    const src = (current.value.kind as any)[key] as SensorSourceConfig | undefined;
+    const cmd = src?.type === "command" ? src.cmd : "";
+    emit("patchKind", current.value.id, key, { type: "command", cmd });
+    return;
+  }
+  try {
+    emit("patchKind", current.value.id, key, JSON.parse(v));
+  } catch {}
+}
+
+function isCommandSource(key: string): boolean {
+  return ((current.value.kind as any)[key] as SensorSourceConfig | undefined)?.type === "command";
 }
 
 // ── Color list editors (ranges / gradient stops) ───────────────────────────
@@ -192,6 +215,18 @@ function listHeadLabel(key: string): string {
   if (key === "gradient_stops") return "Gradient Stops (% of Value Max)";
   if (key === "ranges") return "Gauge Ranges";
   return pretty(key);
+}
+function listNumMin(key: string): number {
+  return key === "ranges" ? -1 : 0;
+}
+function listNumValue(key: string, item: SensorRange | GradientStop): number | null {
+  const v = (item as any)[listNumKey(key)];
+  if (key === "ranges" && (v === null || v === undefined)) return -1;
+  return v ?? 0;
+}
+function commitListNum(key: string, v: number | null): number | null {
+  if (key === "ranges" && v !== null && v < 0) return null;
+  return v;
 }
 
 // ── Number field formatting ────────────────────────────────────────────────
@@ -296,10 +331,17 @@ async function browsePath(key: string) {
           <label class="muted">{{ pretty(key) }}</label>
           <n-select
             size="small"
-            :value="JSON.stringify((current.kind as any)[key])"
+            :value="sourceSelectValue(key)"
             :options="sourceOptionsFor(key)"
             filterable
-            @update:value="(v) => { try { emit('patchKind', current.id, key, JSON.parse(v)); } catch {} }"
+            @update:value="(v) => onSourceSelect(key, v)"
+          />
+          <n-input
+            v-if="isCommandSource(key)"
+            size="small"
+            placeholder="Shell command — must print a number to stdout"
+            :value="(current.kind as any)[key].cmd"
+            @blur="emit('patchKind', current.id, key, { type: 'command', cmd: ($event.target as HTMLInputElement).value })"
           />
         </div>
         <!-- Color list (sensor ranges / gradient stops) -->
@@ -316,11 +358,11 @@ async function browsePath(key: string) {
             class="list-row"
           >
             <n-input-number
-              :value="item[listNumKey(key)]"
+              :value="listNumValue(key, item)"
               size="small"
               :placeholder="listNumLabel(key)"
-              :min="0"
-              @update:value="(v) => patchListItem(key, i, { [listNumKey(key)]: v })"
+              :min="listNumMin(key)"
+              @update:value="(v) => patchListItem(key, i, { [listNumKey(key)]: commitListNum(key, v) })"
             />
             <ColorInline
               :model-value="listItemColor(item)"
@@ -330,6 +372,7 @@ async function browsePath(key: string) {
               <template #icon><Trash2 :size="12" /></template>
             </n-button>
           </div>
+          <div v-if="key === 'ranges'" class="hint muted">Use max = -1 for the open-ended (final) range.</div>
         </div>
         <!-- Color -->
         <div v-else-if="valueKind(key, (current.kind as any)[key]) === 'color'" class="field">
@@ -474,5 +517,9 @@ export default { components: { ColorInline } };
 .empty {
   padding: var(--space-4);
   font-size: var(--font-size-sm);
+}
+.hint {
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
 }
 </style>

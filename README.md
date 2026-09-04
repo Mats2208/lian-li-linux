@@ -36,7 +36,7 @@ own were validated against real hardware, others rely on community testing and f
 | Galahad II Trinity AIO | Yes | Yes | - | Yes | Yes |
 | HydroShift LCD AIO | Yes | Yes | 480x480 | Yes | Yes |
 | Galahad II LCD / Vision AIO | Yes | Yes | 480x480 | Yes | Yes |
-| Strimer Plus (wired) | - | Yes | - | - | - |
+| Strimer Plus (wired) | - | Yes | - | - | Yes |
 
 ### Wireless (via TX/RX dongle)
 
@@ -62,13 +62,13 @@ Both V1 (VID 0x0416) and V2 (VID 0x1A86) wireless dongles are supported. Binding
 | Device | Fan Control | RGB | LCD | Pump | Tested |
 |--------|:-----------:|:---:|:---:|:----:|:------:|
 | HydroShift II LCD Circle | Yes | Yes | 480x480 | Yes | Yes |
-| HydroShift II LCD Square | Yes | Yes | 480x480 | Yes | - |
+| HydroShift II LCD Square | Yes | Yes | 480x480 | Yes | Yes |
 | Lancool 207 Digital | - | - | 720x1472 | - | Yes |
 | Universal Screen 8.8" | - | Yes | 480x1920 | - | Yes |
-| Vision 9.2" | - | - | 464x1920 | - | - |
-| TL Flex LCD | Yes | Yes | 400x400 | - | - |
+| Vision 9.2" | - | - | 464x1920 | - | Yes |
+| TL Flex LCD | Yes | Yes | 400x400 | - | Yes |
 | SL Infinity Flex LCD | Yes | Yes | 400x400 | - | - |
-| HydroShift II OLED Curve | - | Yes | 1080x2288 | Yes | - |
+| HydroShift II OLED Curve | - | Yes | 1080x2288 | Yes | Yes |
 
 ### Desktop Mode (Virtual Display)
 
@@ -109,9 +109,8 @@ The daemon runs as either a per-user or system systemd service (see [Service mod
 
 ### Arch Linux (AUR)
 
-**The AUR is currently down due to recent wave of malware attacks**. Follow the steps to install from PKGBUILD instead.
 ```bash
-yay -S lianli-linux-git # AUR currently down, do not use. Follow below.
+yay -S lianli-linux-git
 ```
 
 You can also build from the PKGBUILD in case AUR is inaccessible:

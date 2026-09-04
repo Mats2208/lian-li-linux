@@ -370,10 +370,9 @@ export interface Widget {
   sensor_category?: string | null;
 }
 
-export interface TemplateBackground {
-  type: "color";
-  rgb: RGBA;
-}
+export type TemplateBackground =
+  | { type: "color"; rgb: RGBA }
+  | { type: "image"; path: string };
 
 export interface LcdTemplate {
   id: string;
